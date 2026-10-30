@@ -1370,4 +1370,4 @@ if __name__ == "__main__":
     import os
     # Render usa la variable PORT y requiere host 0.0.0.0
     port = int(os.getenv("PORT", 8550))
-    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
+    ft.run(main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
