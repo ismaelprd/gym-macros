@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 import re
 import sqlite3
@@ -87,6 +88,15 @@ class DatabaseManager:
                 items TEXT
             )
         """)
+        # Migraciones: actividad física descrita por el usuario + factor calculado por la IA
+        for col_sql in (
+            "ALTER TABLE users ADD COLUMN activity_text TEXT",
+            "ALTER TABLE users ADD COLUMN activity_mult REAL",
+        ):
+            try:
+                self.cursor.execute(col_sql)
+            except Exception:
+                pass
         self.conn.commit()
 
     def get_all_users(self):
@@ -208,6 +218,23 @@ class DatabaseManager:
         self.cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.conn.commit()
 
+    def get_activity_extra(self, user_id):
+        """Devuelve (texto de actividad, factor de actividad o None)."""
+        self.cursor.execute(
+            "SELECT activity_text, activity_mult FROM users WHERE id = ?", (user_id,)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return "", None
+        return row[0] or "", row[1]
+
+    def set_activity_extra(self, user_id, text, mult):
+        self.cursor.execute(
+            "UPDATE users SET activity_text = ?, activity_mult = ? WHERE id = ?",
+            (text or None, mult, user_id),
+        )
+        self.conn.commit()
+
     def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None):
         self.cursor.execute(
             """
@@ -277,14 +304,33 @@ GOALS_META = {
 }
 
 
-def compute_macros(weight, height, age, gender, activity, goal_name):
+def compute_bmr(weight, height, age, gender):
     if gender == "Hombre":
-        bmr = 88.362 + (13.397 * weight) + (4.799 * height) - (5.677 * age)
-    else:
-        bmr = 447.593 + (9.247 * weight) + (3.098 * height) - (4.330 * age)
+        return 88.362 + (13.397 * weight) + (4.799 * height) - (5.677 * age)
+    return 447.593 + (9.247 * weight) + (3.098 * height) - (4.330 * age)
 
-    mult = ACT_MULTIPLIERS.get(activity, ACT_MULTIPLIERS["Moderado"])["mult"]
-    offset = GOALS_META.get(goal_name, GOALS_META["Mantenimiento"])["offset"]
+
+def activity_multiplier(activity, act_mult=None):
+    """Factor de actividad: el calculado por la IA si existe; si no, el del nivel rápido."""
+    if act_mult:
+        return float(act_mult)
+    return ACT_MULTIPLIERS.get(activity, ACT_MULTIPLIERS["Moderado"])["mult"]
+
+
+def nearest_activity_level(mult):
+    return min(ACT_MULTIPLIERS, key=lambda k: abs(ACT_MULTIPLIERS[k]["mult"] - mult))
+
+
+def estimate_exercise_kcal(weight, height, age, gender, mult):
+    """Gasto medio diario por actividad (por encima del reposo)."""
+    return max(0, round(compute_bmr(weight, height, age, gender) * (mult - 1.2)))
+
+
+def compute_macros(weight, height, age, gender, activity, goal_name, offset=None, act_mult=None):
+    bmr = compute_bmr(weight, height, age, gender)
+    mult = activity_multiplier(activity, act_mult)
+    if offset is None:
+        offset = GOALS_META.get(goal_name, GOALS_META["Mantenimiento"])["offset"]
 
     tdee = bmr * mult
     target_kcal = max(1200.0, round(tdee + offset))
@@ -293,6 +339,41 @@ def compute_macros(weight, height, age, gender, activity, goal_name):
     target_c = max(0.0, round((target_kcal - (target_p * 4) - (target_f * 9)) / 4))
 
     return target_kcal, target_p, target_c, target_f, offset
+
+
+_OFFSET_ADVICE = {
+    ("-", "ligero"): "Pérdida lenta y sostenible; es lo que mejor conserva el músculo.",
+    ("-", "moderado"): "El punto dulce para la mayoría de la gente.",
+    ("-", "agresivo"): "Rápido, pero difícil de sostener y con riesgo de perder músculo.",
+    ("-", "muy agresivo"): "No recomendable salvo con supervisión profesional.",
+    ("+", "ligero"): "Ganancia limpia, con muy poca grasa.",
+    ("+", "moderado"): "Buen ritmo de volumen para la mayoría.",
+    ("+", "agresivo"): "Ganarás músculo, pero también bastante grasa.",
+    ("+", "muy agresivo"): "Suele ser excesivo: mucha grasa acumulada.",
+}
+
+
+def describe_offset(offset):
+    """(nombre, color, consejo) de un ajuste calórico respecto al mantenimiento."""
+    a = abs(offset)
+    if a < 50:
+        return "Mantenimiento", "#3F7D58", "Mantienes tu peso actual."
+    if a <= 250:
+        lvl, col = "ligero", "#3F7D58"
+    elif a <= 500:
+        lvl, col = "moderado", "#D9A441"
+    elif a <= 750:
+        lvl, col = "agresivo", "#C9763F"
+    else:
+        lvl, col = "muy agresivo", "#B8453A"
+    sign = "-" if offset < 0 else "+"
+    name = ("Déficit " if offset < 0 else "Superávit ") + lvl
+    return name, col, _OFFSET_ADVICE[(sign, lvl)]
+
+
+def weekly_change_kg(offset):
+    """Cambio de peso aproximado por semana (7700 kcal ≈ 1 kg)."""
+    return offset * 7 / 7700.0
 
 
 # ==========================================
@@ -358,16 +439,36 @@ FOOD_PARSE_PROMPT = (
     "son los TOTALES de esa porción, no por 100 g; valores realistas; nada de texto fuera del JSON."
 )
 
-SUGGEST_PROMPT = (
-    "Eres un nutricionista deportivo. Propón EXACTAMENTE 3 opciones (comida, snack o mini-receta) "
-    "para que el usuario complete su día SIN SUPERAR las calorías restantes. Devuelve SOLO JSON: "
-    '{"options":[{"title":"...","description":"una frase","grams":0,"kcal":0,"p":0,"c":0,"f":0,'
-    '"ingredients":["cantidad + ingrediente"],"steps":["paso corto"]}]}. Reglas: las kcal de cada '
-    "opción deben ser MENORES O IGUALES que las calorías restantes (idealmente entre el 70% y el "
-    "100%); prioriza cubrir la proteína restante sin pasarte de carbohidratos ni grasas restantes; "
-    "ingredientes comunes y baratos; máximo 4 pasos breves; los macros son totales de la opción."
+ACTIVITY_PROMPT = (
+    "Eres un fisiólogo del ejercicio. El usuario describe en español qué actividad física hace y con "
+    "qué frecuencia. Estima su factor de actividad (PAL): el número por el que se multiplica su "
+    "metabolismo basal para obtener el gasto diario total medio, contando el día a día (trabajo, "
+    "pasos) y el ejercicio planificado, promediado sobre la semana. Devuelve SOLO un JSON: "
+    '{"multiplier":1.55,"summary":"una frase explicando el cálculo","exercise_kcal_day":250}. '
+    "Reglas: multiplier entre 1.2 (sedentario total) y 2.1 (atleta con doble sesión o trabajo físico "
+    "duro), con 2 decimales; sé conservador, la gente suele sobreestimar su actividad; "
+    "exercise_kcal_day son las kcal medias diarias gastadas SOLO en ejercicio, promediadas sobre 7 "
+    "días; summary en español, máximo 25 palabras."
 )
 
+PLAN_TOLERANCE = 50  # margen ± kcal por comida
+MAX_MEAL_KCAL = 800  # a partir de aquí se reparte en varias comidas
+MIN_MEAL_KCAL = 150  # no tiene sentido una comida más pequeña
+
+PLAN_PROMPT = (
+    "Eres un nutricionista deportivo y cocinero. El usuario debe completar las calorías del día con "
+    "una o varias comidas. Para CADA comida pedida crea UNA receta sencilla (ingredientes comunes y "
+    "baratos, máximo 20 minutos) cuyas calorías se acerquen lo máximo posible al OBJETIVO de esa "
+    "comida; prioriza la proteína, no repitas el ingrediente principal entre comidas y respeta "
+    "alergias y preferencias. Devuelve SOLO JSON con este formato: "
+    '{"meals":[{"title":"...","description":"una frase","ingredients":[{"name":"...","grams":0,'
+    '"p":0,"c":0,"f":0}],"steps":["paso corto"]}]}. Reglas: un elemento de "meals" por cada comida '
+    "pedida y en el mismo orden; en cada ingrediente, \"name\" va SIN cantidades ni medidas, "
+    "\"grams\" es el peso en gramos de la cantidad usada y p, c, f son los gramos TOTALES de "
+    "proteína, carbohidratos y grasa de esa cantidad (no por 100 g), con valores nutricionales "
+    "realistas; 4*p + 4*c + 9*f sumado de todos los ingredientes debe dar las kcal objetivo; los "
+    "pasos NO mencionan cantidades; máximo 4 pasos."
+)
 
 def ai_parse_foods(description):
     data = extract_json(ask_ai(FOOD_PARSE_PROMPT, description))
@@ -391,40 +492,121 @@ def ai_parse_foods(description):
     return items
 
 
-def ai_suggest(remaining, eaten_names, meal_name):
-    user_text = (
-        f"Tipo de comida: {meal_name}. Restante hoy: {int(remaining['kcal'])} kcal, "
-        f"{int(remaining['p'])} g proteína, {int(remaining['c'])} g carbohidratos, "
-        f"{int(remaining['f'])} g grasa. Ya ha comido hoy: {', '.join(eaten_names) or 'nada aún'}."
-    )
-    data = extract_json(ask_ai(SUGGEST_PROMPT, user_text, max_tokens=2200))
-    options = []
-    for o in data.get("options", []):
-        kcal = _num(o.get("kcal"))
-        # Garantía de "sin pasarte": descartamos lo que supere lo restante
-        if o.get("title") and 0 < kcal <= remaining["kcal"]:
-            options.append(
-                {
-                    "title": str(o["title"]),
-                    "description": str(o.get("description", "")),
-                    "grams": round(_num(o.get("grams")) or 100),
-                    "kcal": round(kcal, 1),
-                    "p": round(_num(o.get("p")), 1),
-                    "c": round(_num(o.get("c")), 1),
-                    "f": round(_num(o.get("f")), 1),
-                    "ingredients": [str(x) for x in o.get("ingredients", [])][:10],
-                    "steps": [str(x) for x in o.get("steps", [])][:5],
-                }
-            )
-    return options
+def ai_estimate_activity(text, weight, height, age, gender):
+    """La IA interpreta la actividad descrita y devuelve factor de actividad y gasto por ejercicio."""
+    user_text = f"Sexo: {gender}. Edad: {age} años. Peso: {weight} kg. Altura: {height} cm. Actividad: {text}"
+    data = extract_json(ask_ai(ACTIVITY_PROMPT, user_text, max_tokens=1200))
+    try:
+        mult = float(data.get("multiplier"))
+    except Exception:
+        raise ValueError("La IA no pudo estimar tu actividad. Descríbela con más detalle.")
+    mult = max(1.2, min(2.1, mult))
+    return {
+        "mult": round(mult, 3),
+        "summary": str(data.get("summary", "")).strip()[:220],
+        "exercise_kcal": int(min(1500, _num(data.get("exercise_kcal_day")))),
+    }
 
+
+def split_calories(total, n):
+    """Reparte `total` kcal en `n` partes enteras que suman exactamente `total`."""
+    total, n = int(round(total)), max(1, int(n))
+    base, extra = divmod(total, n)
+    return [base + (1 if i < extra else 0) for i in range(n)]
+
+
+def _plan_from_ai(m, target):
+    """Valida una receta de la IA y ajusta las cantidades para clavar las kcal objetivo.
+
+    Las kcal se calculan SIEMPRE a partir de los macros (4/4/9) y las cantidades se escalan
+    proporcionalmente, así que el resultado queda dentro del margen aunque la IA calcule mal.
+    """
+    if not isinstance(m, dict) or not str(m.get("title", "")).strip():
+        return None
+    ings = []
+    for ing in m.get("ingredients") or []:
+        if not isinstance(ing, dict):
+            continue
+        name = str(ing.get("name", "")).strip()
+        g = _num(ing.get("grams"))
+        if name and g > 0:
+            ings.append(
+                {"name": name, "grams": g, "p": _num(ing.get("p")), "c": _num(ing.get("c")), "f": _num(ing.get("f"))}
+            )
+    if not ings:
+        return None
+    raw = sum(4 * i["p"] + 4 * i["c"] + 9 * i["f"] for i in ings)
+    if raw <= 0:
+        return None
+    factor = target["kcal"] / raw
+    if not 0.5 <= factor <= 2.0:  # la receta de la IA queda demasiado lejos: mejor pedir otra
+        return None
+    final, tp, tc, tf, grams_total = [], 0.0, 0.0, 0.0, 0
+    for i in ings:
+        g2 = max(1, round(i["grams"] * factor))
+        r = g2 / i["grams"]
+        tp, tc, tf = tp + i["p"] * r, tc + i["c"] * r, tf + i["f"] * r
+        grams_total += g2
+        final.append({"name": i["name"], "grams": g2})
+    kcal = 4 * tp + 4 * tc + 9 * tf
+    if abs(kcal - target["kcal"]) > PLAN_TOLERANCE:
+        return None
+    return {
+        "meal": target["meal"],
+        "title": str(m["title"]).strip(),
+        "description": str(m.get("description", "")).strip(),
+        "target_kcal": target["kcal"],
+        "kcal": round(kcal),
+        "p": round(tp, 1),
+        "c": round(tc, 1),
+        "f": round(tf, 1),
+        "grams": grams_total,
+        "ingredients": final,
+        "steps": [str(x) for x in (m.get("steps") or [])][:5],
+    }
+
+
+def ai_plan(targets, eaten_names, prefs=""):
+    """Una receta por objetivo. Devuelve una lista (None donde no se pudo ajustar)."""
+    plans = [None] * len(targets)
+    for attempt in range(2):
+        pending = [i for i, p in enumerate(plans) if p is None]
+        if not pending:
+            break
+        lines = []
+        for n, i in enumerate(pending, 1):
+            t = targets[i]
+            macros = ", ".join(
+                f"~{t[k]} g {lbl}" for k, lbl in (("p", "proteína"), ("c", "carbohidratos"), ("f", "grasa")) if t[k] > 0
+            )
+            lines.append(f"Comida {n} ({t['meal']}): OBJETIVO {t['kcal']} kcal" + (f", {macros}" if macros else ""))
+        user_text = (
+            f"Comidas a crear ({len(pending)}): " + "; ".join(lines) + ". "
+            f"Ya ha comido hoy: {', '.join(eaten_names) or 'nada aún'}. "
+            f"Preferencias o alergias: {prefs or 'ninguna'}."
+        )
+        if attempt:
+            user_text += (
+                " IMPORTANTE: en el intento anterior las calorías quedaron lejos del objetivo. "
+                "Ajusta las cantidades para que 4*p + 4*c + 9*f de los ingredientes sume justo las kcal pedidas."
+            )
+        try:
+            data = extract_json(ask_ai(PLAN_PROMPT, user_text, max_tokens=1000 * len(pending) + 1500))
+        except Exception:
+            if attempt == 0:
+                raise
+            break
+        meals = data.get("meals") if isinstance(data, dict) else data
+        for idx, m in zip(pending, meals or []):
+            plans[idx] = _plan_from_ai(m, targets[idx])
+    return plans
 
 BTN_ICONS = {
     "➕": ft.Icons.ADD, "✅": ft.Icons.CHECK, "⭐": ft.Icons.STAR_OUTLINE,
     "🔍": ft.Icons.SEARCH, "📸": ft.Icons.PHOTO_CAMERA_OUTLINED, "✖": ft.Icons.CLOSE,
     "⬅": ft.Icons.ARROW_BACK, "➡": ft.Icons.ARROW_FORWARD, "💡": ft.Icons.LIGHTBULB_OUTLINE,
     "✨": ft.Icons.AUTO_AWESOME_OUTLINED, "⚡": ft.Icons.TUNE, "👥": ft.Icons.SWAP_HORIZ,
-    "🚀": ft.Icons.CHECK,
+    "🚀": ft.Icons.CHECK, "🔄": ft.Icons.REFRESH,
 }
 
 
@@ -470,6 +652,152 @@ def food_thumb(url, size=44):
         border_radius=10,
         error_content=placeholder,
     )
+
+
+# ==========================================
+# LECTURA DE CÓDIGOS (QR / EAN) Y OPENFOODFACTS
+# ==========================================
+try:  # opcional: pyzbar lee muy bien EAN/UPC si está instalado
+    from pyzbar import pyzbar as _pyzbar
+except Exception:
+    _pyzbar = None
+
+
+def barcode_engines():
+    """(OpenCV con lector de barras, pyzbar) disponibles en este servidor."""
+    return hasattr(cv2, "barcode"), _pyzbar is not None
+
+
+def valid_ean(code):
+    """Comprueba longitud y dígito de control de EAN-8 / UPC-A / EAN-13 / GTIN-14."""
+    if not code or not code.isdigit() or len(code) not in (8, 12, 13, 14):
+        return False
+    digits = [int(x) for x in code]
+    body = digits[:-1][::-1]
+    total = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(body))
+    return (10 - total % 10) % 10 == digits[-1]
+
+
+def _cv_barcode_read(det, img):
+    """Lee códigos con el detector de OpenCV sin depender de la firma exacta de cada versión."""
+    try:
+        res = det.detectAndDecodeWithType(img)
+    except Exception:
+        try:
+            res = det.detectAndDecode(img)
+        except Exception:
+            return []
+    out = []
+    for part in res if isinstance(res, tuple) else (res,):
+        if isinstance(part, str):
+            out.append(part)
+        elif isinstance(part, (tuple, list)):
+            out += [x for x in part if isinstance(x, str)]
+    return [s.strip() for s in out if s.strip().isdigit()]
+
+
+def _scaled(img, s):
+    if s == 1.0:
+        return img
+    return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
+
+
+def _barcode_variants(img):
+    """Versiones de un fotograma (de la más probable a la más costosa) para facilitar la lectura.
+
+    El detector de OpenCV solo lee códigos cuyo ancho ronda los 150-300 px, así que se prueba
+    una pirámide de escalas: reducida si el código está muy cerca, ampliada si está lejos.
+    """
+    h, w = img.shape[:2]
+    center = img[int(h * 0.2) : int(h * 0.8), int(w * 0.1) : int(w * 0.9)]  # el código suele ir centrado
+    for sc in (1.0, 0.5, 0.35, 0.7, 0.25, 0.18):  # código grande/cerca
+        yield _scaled(img, sc)
+    for sc in (1.5, 2.0):  # código pequeño/lejos
+        yield _scaled(center, sc)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    eq = cv2.cvtColor(cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray), cv2.COLOR_GRAY2BGR)
+    blur = cv2.GaussianBlur(gray, (0, 0), 3)
+    sharp = cv2.cvtColor(cv2.addWeighted(gray, 1.8, blur, -0.8, 0), cv2.COLOR_GRAY2BGR)
+    for enhanced in (eq, sharp):  # poca luz / desenfoque
+        for sc in (1.0, 0.5):
+            yield _scaled(enhanced, sc)
+    rot = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)  # códigos en vertical
+    for sc in (1.0, 0.5, 0.35):
+        yield _scaled(rot, sc)
+
+
+def decode_frame(image_bytes):
+    """Texto de un QR o de un código de barras VÁLIDO (con dígito de control), o '' si no hay."""
+    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return ""
+    try:
+        data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+        if data:
+            return data
+    except Exception:
+        pass
+    if _pyzbar is not None:
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            for b in _pyzbar.decode(gray):
+                txt = b.data.decode("utf-8", "ignore").strip()
+                if valid_ean(txt) or txt.startswith("{"):
+                    return txt
+        except Exception:
+            pass
+    if hasattr(cv2, "barcode"):
+        try:
+            det = cv2.barcode.BarcodeDetector()
+        except Exception:
+            det = None
+        if det is not None:
+            for variant in _barcode_variants(img):
+                for code in _cv_barcode_read(det, variant):
+                    if valid_ean(code):
+                        return code
+    return ""
+
+
+def off_nutri(nutr):
+    """(kcal, proteína, carbos, grasa) por 100 g desde OpenFoodFacts; si faltan kcal usa los kJ."""
+    nutr = nutr or {}
+    kcal = nutr.get("energy-kcal_100g")
+    if kcal in (None, ""):
+        kj = nutr.get("energy_100g")
+        kcal = _num(kj) / 4.184 if kj not in (None, "") else 0
+    return (
+        _num(kcal),
+        _num(nutr.get("proteins_100g")),
+        _num(nutr.get("carbohydrates_100g")),
+        _num(nutr.get("fat_100g")),
+    )
+
+
+def lookup_product(code):
+    """Busca un código en OpenFoodFacts: dict del producto, None si no existe (o error de red)."""
+    cands = [code]
+    if len(code) == 12:
+        cands.append("0" + code)  # UPC-A guardado como EAN-13
+    if len(code) == 13 and code.startswith("0"):
+        cands.append(code[1:])
+    for cand in cands:
+        resp = requests.get(
+            f"https://world.openfoodfacts.org/api/v2/product/{cand}.json",
+            params={"fields": "product_name,nutriments,image_front_url,image_url"},
+            headers={"User-Agent": "GymMacroProApp - Mobile - Version 3.0"},
+            timeout=8,
+        )
+        data = resp.json()
+        if data.get("status") == 1 and data.get("product"):
+            prod = data["product"]
+            k, p, c, f = off_nutri(prod.get("nutriments"))
+            return {
+                "name": prod.get("product_name") or "Producto escaneado",
+                "kcal": k, "p": p, "c": c, "f": f,
+                "image": prod.get("image_front_url") or prod.get("image_url"),
+            }
+    return None
 
 
 # ==========================================
@@ -658,6 +986,10 @@ def main(page: ft.Page):
     def show_onboarding_wizard(is_first_user=False, edit_user_data=None):
         step = [0]  # 0: Identidad, 1: Biometría, 2: Actividad, 3: Objetivo + Resumen
 
+        act_text0, act_mult0 = (
+            db.get_activity_extra(edit_user_data[0]) if edit_user_data else ("", None)
+        )
+
         # Estado temporal del formulario dinámico
         wiz_state = {
             "id": edit_user_data[0] if edit_user_data else None,
@@ -668,7 +1000,14 @@ def main(page: ft.Page):
             "age": int(edit_user_data[5]) if edit_user_data else 24,
             "gender": edit_user_data[6] if edit_user_data else "Hombre",
             "activity": edit_user_data[7] if edit_user_data else "Moderado",
-            "goal": edit_user_data[8] if edit_user_data else "Mantenimiento",
+            # Ajuste calórico (kcal) sobre el mantenimiento: se elige con la barra deslizante
+            "offset": float(edit_user_data[9] or 0.0) if edit_user_data else 0.0,
+            # Actividad descrita con palabras y analizada por la IA
+            "act_text": act_text0,
+            "act_mult": act_mult0,
+            "act_kcal": None,
+            "act_summary": "",
+            "act_busy": False,
         }
 
         AVATARS = ["💪", "🔥", "⚡", "🏋️", "🧘", "🏃", "🥗", "🏆"]
@@ -686,6 +1025,19 @@ def main(page: ft.Page):
             border_radius=10,
             border_color="#D6D0C2",
             on_change=lambda e: wiz_state.update({"name": e.control.value}),
+        )
+
+        tf_wiz_act = ft.TextField(
+            label="¿Qué actividad haces y con qué frecuencia?",
+            hint_text="Ej: Gimnasio 4 días/semana (1 h de pesas), camino 30 min al día, trabajo sentado",
+            value=wiz_state["act_text"] or "",
+            multiline=True,
+            min_lines=3,
+            max_lines=5,
+            bgcolor="#ffffff",
+            border_radius=10,
+            border_color="#D6D0C2",
+            on_change=lambda e: wiz_state.update({"act_text": e.control.value}),
         )
 
         def change_metric(key, delta, min_v, max_v):
@@ -897,40 +1249,39 @@ def main(page: ft.Page):
                 )
 
             elif s == 2:
-                # PASO 3: Nivel de Actividad
+                # PASO 3: Actividad física (texto libre analizado por la IA, o niveles rápidos)
+                custom = bool(wiz_state["act_mult"])
+
+                def pick_level(an):
+                    wiz_state.update(
+                        {"activity": an, "act_mult": None, "act_kcal": None, "act_summary": "", "act_text": ""}
+                    )
+                    tf_wiz_act.value = ""
+                    render_wizard_step()
+
                 act_col = ft.Column(spacing=10)
                 for act_name, meta in ACT_MULTIPLIERS.items():
-                    active = wiz_state["activity"] == act_name
+                    active = (not custom) and wiz_state["activity"] == act_name
                     act_col.controls.append(
                         ft.Container(
                             bgcolor="#24543F" if active else "#ffffff",
-                            padding=16,
+                            padding=14,
                             border_radius=12,
                             shadow=CARD_SHADOW, border=CARD_BORDER,
-                            on_click=lambda e, an=act_name: (
-                                wiz_state.update({"activity": an}),
-                                render_wizard_step(),
-                            ),
+                            on_click=lambda e, an=act_name: pick_level(an),
                             content=ft.Row(
                                 [
-                                    ft.Icon(meta["icon"], size=24, color="white" if active else "#24543F"),
+                                    ft.Icon(meta["icon"], size=22, color="white" if active else "#24543F"),
                                     ft.Container(width=8),
                                     ft.Column(
                                         [
                                             ft.Text(
-                                                act_name,
-                                                size=16,
-                                                weight=ft.FontWeight.W_600,
-                                                color="white"
-                                                if active
-                                                else "#1C1B18",
+                                                act_name, size=15, weight=ft.FontWeight.W_600,
+                                                color="white" if active else "#1C1B18",
                                             ),
                                             ft.Text(
-                                                meta["desc"],
-                                                size=12,
-                                                color="#CFE0D5"
-                                                if active
-                                                else "#77736A",
+                                                meta["desc"], size=12,
+                                                color="#CFE0D5" if active else "#77736A",
                                             ),
                                         ],
                                         spacing=2,
@@ -941,19 +1292,48 @@ def main(page: ft.Page):
                         )
                     )
 
+                ai_card = ft.Container()
+                if custom:
+                    ai_card = ft.Container(
+                        bgcolor="#E3ECE6",
+                        border_radius=12,
+                        padding=14,
+                        content=ft.Column(
+                            [
+                                ft.Text(
+                                    f"Factor de actividad calculado: ×{wiz_state['act_mult']:.2f}",
+                                    size=15, weight=ft.FontWeight.W_600, color="#24543F",
+                                ),
+                                ft.Text(wiz_state["act_summary"] or "Calculado a partir de tu descripción.", size=12, color="#3A3832"),
+                                ft.Text(
+                                    f"Gasto medio por ejercicio: ~{int(wiz_state['act_kcal'] or 0)} kcal/día"
+                                    if wiz_state["act_kcal"] is not None
+                                    else "Se usará para calcular tus calorías.",
+                                    size=12, color="#77736A",
+                                ),
+                            ],
+                            spacing=4,
+                        ),
+                    )
+
                 wiz_body.content = ft.Column(
                     [
+                        ft.Text("Tu actividad física", size=26, weight=ft.FontWeight.W_600, color="#1C1B18"),
                         ft.Text(
-                            "Nivel de actividad",
-                            size=26,
-                            weight=ft.FontWeight.W_600,
-                            color="#1C1B18",
+                            "Cuéntame qué haces y cada cuánto. La IA lo tendrá en cuenta para calcular tus calorías.",
+                            size=13, color="#77736A",
                         ),
-                        ft.Text(
-                            "¿Cuánto te mueves durante la semana?",
-                            size=13,
-                            color="#77736A",
+                        tf_wiz_act,
+                        make_button("✨ Calcular con IA", "#1C1B18", analyze_activity),
+                        ft.Row(
+                            [
+                                ft.ProgressRing(width=18, height=18, stroke_width=3),
+                                ft.Text("Analizando tu actividad…", size=13, color="#77736A"),
+                            ],
+                            visible=bool(wiz_state["act_busy"]),
                         ),
+                        ai_card,
+                        ft.Text("O elige un nivel rápido:", size=13, weight=ft.FontWeight.W_600, color="#77736A"),
                         act_col,
                     ],
                     scroll=ft.ScrollMode.AUTO,
@@ -961,58 +1341,101 @@ def main(page: ft.Page):
                 )
 
             elif s == 3:
-                # PASO 4: Objetivo y Cálculo Instantáneo
-                tkcal, tp, tc, tf, _ = compute_macros(
-                    wiz_state["weight"],
-                    wiz_state["height"],
-                    wiz_state["age"],
-                    wiz_state["gender"],
-                    wiz_state["activity"],
-                    wiz_state["goal"],
+                # PASO 4: Objetivo con barra deslizante + cálculo instantáneo
+                w_, h_, a_, g_ = wiz_state["weight"], wiz_state["height"], wiz_state["age"], wiz_state["gender"]
+                bmr = compute_bmr(w_, h_, a_, g_)
+                mult = activity_multiplier(wiz_state["activity"], wiz_state["act_mult"])
+                tdee = bmr * mult
+
+                lbl_goal = ft.Text("", size=22, weight=ft.FontWeight.W_600)
+                lbl_goal_off = ft.Text("", size=13, weight=ft.FontWeight.W_600, color="#3A3832")
+                lbl_goal_week = ft.Text("", size=12, color="#77736A")
+                lbl_goal_adv = ft.Text("", size=12, color="#77736A")
+                lbl_warn = ft.Text("", size=12, color="#B8453A", visible=False)
+                lbl_kcal = ft.Text("", size=34, weight=ft.FontWeight.W_600, color="white")
+                lbl_tdee = ft.Text("", size=12, color="#A9A59B")
+                lbl_tc = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#E3B965")
+                lbl_tp = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#3F7D58")
+                lbl_tf = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#C9763F")
+
+                def refresh_goal():
+                    off = wiz_state["offset"]
+                    tkcal, tp, tc, tf, _ = compute_macros(
+                        w_, h_, a_, g_, wiz_state["activity"], "", offset=off, act_mult=wiz_state["act_mult"]
+                    )
+                    title, color, advice = describe_offset(off)
+                    lbl_goal.value = title
+                    lbl_goal.color = color
+                    lbl_goal_off.value = (
+                        "Sin ajuste sobre tu mantenimiento" if abs(off) < 50 else f"{int(off):+d} kcal sobre tu mantenimiento"
+                    )
+                    wk = weekly_change_kg(off)
+                    lbl_goal_week.value = (
+                        "" if abs(off) < 50
+                        else f"≈ {abs(wk):.2f} kg/semana {'perdiendo' if off < 0 else 'ganando'}"
+                    )
+                    lbl_goal_week.visible = bool(lbl_goal_week.value)
+                    lbl_goal_adv.value = advice
+                    slider.active_color = color
+                    lbl_kcal.value = f"{int(tkcal):,} kcal".replace(",", ".")
+                    lbl_tdee.value = f"Mantenimiento: {int(round(tdee)):,} kcal/día".replace(",", ".")
+                    lbl_tc.value, lbl_tp.value, lbl_tf.value = f"{int(tc)}g", f"{int(tp)}g", f"{int(tf)}g"
+                    if tdee + off < 1200:
+                        lbl_warn.value = "Se aplica el mínimo de seguridad de 1.200 kcal/día."
+                    elif tkcal < bmr:
+                        lbl_warn.value = f"Por debajo de tu metabolismo basal (~{int(bmr)} kcal): difícil de sostener."
+                    else:
+                        lbl_warn.value = ""
+                    lbl_warn.visible = bool(lbl_warn.value)
+
+                def on_slide(e):
+                    wiz_state["offset"] = float(round(float(e.control.value) / 50.0) * 50)
+                    refresh_goal()
+                    page.update()
+
+                slider = ft.Slider(
+                    min=-1000, max=1000, divisions=40,
+                    value=max(-1000.0, min(1000.0, wiz_state["offset"])),
+                    label="{value} kcal",
+                    on_change=on_slide,
                 )
 
-                goals_col = ft.Column(spacing=10)
-                for g_name, meta in GOALS_META.items():
-                    active = wiz_state["goal"] == g_name
-                    goals_col.controls.append(
-                        ft.Container(
-                            bgcolor="#24543F" if active else "#ffffff",
-                            padding=14,
-                            border_radius=12,
-                            shadow=CARD_SHADOW, border=CARD_BORDER,
-                            on_click=lambda e, gn=g_name: (
-                                wiz_state.update({"goal": gn}),
-                                render_wizard_step(),
-                            ),
-                            content=ft.Row(
-                                [
-                                    ft.Icon(meta["icon"], size=24, color="white" if active else "#24543F"),
-                                    ft.Container(width=8),
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                g_name,
-                                                size=16,
-                                                weight=ft.FontWeight.W_600,
-                                                color="white"
-                                                if active
-                                                else "#1C1B18",
-                                            ),
-                                            ft.Text(
-                                                meta["desc"],
-                                                size=12,
-                                                color="#CFE0D5"
-                                                if active
-                                                else "#77736A",
-                                            ),
-                                        ],
-                                        spacing=2,
-                                        expand=True,
-                                    ),
-                                ]
-                            ),
-                        )
+                def set_offset(v):
+                    wiz_state["offset"] = float(v)
+                    render_wizard_step()
+
+                def quick_chip(text, v):
+                    return ft.Container(
+                        bgcolor="#ffffff", border=CARD_BORDER, border_radius=10,
+                        padding=ft.Padding(left=12, right=12, top=9, bottom=9),
+                        on_click=lambda e, v=v: set_offset(v),
+                        content=ft.Text(text, size=12, weight=ft.FontWeight.W_600, color="#24543F"),
                     )
+
+                refresh_goal()
+
+                goal_card = ft.Container(
+                    bgcolor="#ffffff", border_radius=14, padding=16, shadow=CARD_SHADOW, border=CARD_BORDER,
+                    content=ft.Column(
+                        [
+                            lbl_goal,
+                            lbl_goal_off,
+                            slider,
+                            ft.Row(
+                                [
+                                    ft.Text("Déficit", size=11, color="#A9A59B"),
+                                    ft.Text("Mantener", size=11, color="#A9A59B"),
+                                    ft.Text("Superávit", size=11, color="#A9A59B"),
+                                ],
+                                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                            ),
+                            lbl_goal_week,
+                            lbl_goal_adv,
+                            lbl_warn,
+                        ],
+                        spacing=6,
+                    ),
+                )
 
                 summary_card = ft.Container(
                     bgcolor="#1C1B18",
@@ -1020,69 +1443,18 @@ def main(page: ft.Page):
                     border_radius=14,
                     content=ft.Column(
                         [
-                            ft.Text(
-                                "OBJETIVO DIARIO",
-                                size=12,
-                                color="#E3B965",
-                                weight=ft.FontWeight.W_600,
-                            ),
-                            ft.Text(
-                                f"{int(tkcal):,} kcal".replace(",", "."),
-                                size=34,
-                                weight=ft.FontWeight.W_600,
-                                color="white",
-                            ),
+                            ft.Text("OBJETIVO DIARIO", size=12, color="#E3B965", weight=ft.FontWeight.W_600),
+                            lbl_kcal,
+                            lbl_tdee,
                             ft.Divider(color="#3A3832"),
                             ft.Row(
                                 [
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                f"{int(tc)}g",
-                                                size=18,
-                                                weight=ft.FontWeight.W_600,
-                                                color="#E3B965",
-                                            ),
-                                            ft.Text(
-                                                "Carbos",
-                                                size=12,
-                                                color="#A9A59B",
-                                            ),
-                                        ],
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    ),
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                f"{int(tp)}g",
-                                                size=18,
-                                                weight=ft.FontWeight.W_600,
-                                                color="#3F7D58",
-                                            ),
-                                            ft.Text(
-                                                "Proteína",
-                                                size=12,
-                                                color="#A9A59B",
-                                            ),
-                                        ],
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    ),
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                f"{int(tf)}g",
-                                                size=18,
-                                                weight=ft.FontWeight.W_600,
-                                                color="#C9763F",
-                                            ),
-                                            ft.Text(
-                                                "Grasas",
-                                                size=12,
-                                                color="#A9A59B",
-                                            ),
-                                        ],
-                                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                                    ),
+                                    ft.Column([lbl_tc, ft.Text("Carbos", size=12, color="#A9A59B")],
+                                              horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                                    ft.Column([lbl_tp, ft.Text("Proteína", size=12, color="#A9A59B")],
+                                              horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                                    ft.Column([lbl_tf, ft.Text("Grasas", size=12, color="#A9A59B")],
+                                              horizontal_alignment=ft.CrossAxisAlignment.CENTER),
                                 ],
                                 alignment=ft.MainAxisAlignment.SPACE_AROUND,
                             ),
@@ -1094,13 +1466,16 @@ def main(page: ft.Page):
 
                 wiz_body.content = ft.Column(
                     [
+                        ft.Text("¿Cuánto quieres recortar o sumar?", size=26, weight=ft.FontWeight.W_600, color="#1C1B18"),
                         ft.Text(
-                            "¿Cuál es tu objetivo?",
-                            size=26,
-                            weight=ft.FontWeight.W_600,
-                            color="#1C1B18",
+                            "Desliza la barra: a la izquierda déficit (perder grasa), a la derecha superávit (ganar).",
+                            size=13, color="#77736A",
                         ),
-                        goals_col,
+                        goal_card,
+                        ft.Row(
+                            [quick_chip("Definición −400", -400), quick_chip("Mantener 0", 0), quick_chip("Volumen +350", 350)],
+                            spacing=8, wrap=True,
+                        ),
                         summary_card,
                     ],
                     scroll=ft.ScrollMode.AUTO,
@@ -1159,11 +1534,47 @@ def main(page: ft.Page):
                     notify("Escribe tu nombre para continuar", "#B8453A")
                     return
                 wiz_state["name"] = name_clean
+            elif step[0] == 2:
+                if wiz_state["act_busy"]:
+                    notify("Espera a que termine el análisis de tu actividad", "#C9763F")
+                    return
+                if (tf_wiz_act.value or "").strip() and not wiz_state["act_mult"]:
+                    notify("Pulsa «Calcular con IA» para usar tu descripción, o elige un nivel rápido", "#C9763F")
+                    return
             step[0] += 1
             render_wizard_step()
 
         def prev_step():
             step[0] -= 1
+            render_wizard_step()
+
+        async def analyze_activity(e=None):
+            txt = (tf_wiz_act.value or "").strip()
+            if not txt:
+                notify("Cuéntame qué actividad haces y cada cuánto", "#B8453A")
+                return
+            wiz_state["act_text"] = txt
+            wiz_state["act_busy"] = True
+            render_wizard_step()
+            try:
+                res = await asyncio.to_thread(
+                    ai_estimate_activity, txt, wiz_state["weight"], wiz_state["height"],
+                    wiz_state["age"], wiz_state["gender"],
+                )
+            except Exception as ex:
+                wiz_state["act_busy"] = False
+                render_wizard_step()
+                notify(f"IA: {ex}", "#B8453A")
+                return
+            wiz_state.update(
+                {
+                    "act_busy": False,
+                    "act_mult": res["mult"],
+                    "act_kcal": res["exercise_kcal"],
+                    "act_summary": res["summary"],
+                    "activity": nearest_activity_level(res["mult"]),
+                }
+            )
             render_wizard_step()
 
         def finish_wizard():
@@ -1174,44 +1585,49 @@ def main(page: ft.Page):
                 wiz_state["age"],
                 wiz_state["gender"],
                 wiz_state["activity"],
-                wiz_state["goal"],
+                "",
+                offset=float(wiz_state["offset"]),
+                act_mult=wiz_state["act_mult"],
+            )
+            goal_name = describe_offset(offset)[0]
+            mult = activity_multiplier(wiz_state["activity"], wiz_state["act_mult"])
+            burned = (
+                float(wiz_state["act_kcal"])
+                if wiz_state["act_kcal"] is not None
+                else float(
+                    estimate_exercise_kcal(
+                        wiz_state["weight"], wiz_state["height"], wiz_state["age"], wiz_state["gender"], mult
+                    )
+                )
+            )
+            args = (
+                name_clean,
+                wiz_state["avatar"],
+                wiz_state["weight"],
+                wiz_state["height"],
+                wiz_state["age"],
+                wiz_state["gender"],
+                wiz_state["activity"],
+                goal_name,
+                offset,
+                tkcal,
+                tp,
+                tc,
+                tf,
+                burned,
             )
             if wiz_state["id"] is not None:
-                db.update_user(
-                    wiz_state["id"],
-                    name_clean,
-                    wiz_state["avatar"],
-                    wiz_state["weight"],
-                    wiz_state["height"],
-                    wiz_state["age"],
-                    wiz_state["gender"],
-                    wiz_state["activity"],
-                    wiz_state["goal"],
-                    offset,
-                    tkcal,
-                    tp,
-                    tc,
-                    tf,
-                )
+                db.update_user(wiz_state["id"], *args)
                 uid = wiz_state["id"]
                 notify("Perfil actualizado con éxito", "#3F7D58")
             else:
-                uid = db.create_user(
-                    name_clean,
-                    wiz_state["avatar"],
-                    wiz_state["weight"],
-                    wiz_state["height"],
-                    wiz_state["age"],
-                    wiz_state["gender"],
-                    wiz_state["activity"],
-                    wiz_state["goal"],
-                    offset,
-                    tkcal,
-                    tp,
-                    tc,
-                    tf,
-                )
+                uid = db.create_user(*args)
                 notify(f"¡Bienvenido/a {name_clean}!", "#3F7D58")
+            db.set_activity_extra(
+                uid,
+                (wiz_state["act_text"] or "").strip() if wiz_state["act_mult"] else "",
+                wiz_state["act_mult"],
+            )
 
             login_as_user(uid)
 
@@ -1489,27 +1905,6 @@ def main(page: ft.Page):
                                     ),
                                 )
                             )
-                        meals_card_col.controls.append(
-                            ft.Container(
-                                bgcolor="#FAF8F4",
-                                padding=ft.Padding(left=10, right=10, top=0, bottom=10),
-                                content=make_button(
-                                    "⭐ Guardar como comida fija",
-                                    "#C9763F",
-                                    lambda e, mn=m_name, mf=m_foods: save_fixed_dialog(
-                                        [
-                                            {
-                                                "name": x[2], "grams": x[3], "kcal": x[4],
-                                                "p": x[5], "c": x[6], "f": x[7], "image": x[8],
-                                            }
-                                            for x in mf
-                                        ],
-                                        f"{mn} habitual",
-                                        mn,
-                                    ),
-                                ),
-                            )
-                        )
 
                 if idx < len(meal_names) - 1:
                     meals_card_col.controls.append(
@@ -1543,7 +1938,7 @@ def main(page: ft.Page):
             await go_suggestions(e)
 
         suggest_btn = make_button(
-            "💡 ¿Qué como para llegar a mis calorías?", "#1C1B18", _go_sugg
+            "💡 Plan de recetas para llegar a mis calorías", "#1C1B18", _go_sugg
         )
 
         view_home = ft.Container(
@@ -1826,16 +2221,19 @@ def main(page: ft.Page):
                         )
 
             try:
-                url = f"https://world.openfoodfacts.org/cgi/search.pl?search_terms={query}&search_simple=1&action=process&json=1&page_size=4"
-                resp = requests.get(url, headers=OFF_HEADERS, timeout=6).json()
+                resp = requests.get(
+                    "https://world.openfoodfacts.org/cgi/search.pl",
+                    params={
+                        "search_terms": query, "search_simple": 1, "action": "process",
+                        "json": 1, "page_size": 4,
+                    },
+                    headers=OFF_HEADERS,
+                    timeout=6,
+                ).json()
                 for prod in resp.get("products", []):
                     pname = prod.get("product_name") or "Alimento"
                     img = prod.get("image_front_small_url") or prod.get("image_url")
-                    nutr = prod.get("nutriments", {})
-                    k = nutr.get("energy-kcal_100g", 0)
-                    p = nutr.get("proteins_100g", 0)
-                    c = nutr.get("carbohydrates_100g", 0)
-                    f = nutr.get("fat_100g", 0)
+                    k, p, c, f = off_nutri(prod.get("nutriments"))
                     search_results.controls.append(
                         ft.Container(
                             bgcolor="#ffffff",
@@ -1856,7 +2254,7 @@ def main(page: ft.Page):
                                                 color="#3A3832",
                                             ),
                                             ft.Text(
-                                                f"100g: {int(k or 0)} kcal | C: {c or 0}g | P: {p or 0}g | G: {f or 0}g",
+                                                f"100g: {int(k)} kcal | C: {c:.1f}g | P: {p:.1f}g | G: {f:.1f}g",
                                                 size=11,
                                                 color="#77736A",
                                             ),
@@ -1877,6 +2275,8 @@ def main(page: ft.Page):
                 )
             page.update()
 
+        sw_fixed = ft.Switch(label="Guardar también como comida fija", value=False)
+
         def save_food_entry(e):
             try:
                 name = (tf_name.value or "").strip() or "Alimento"
@@ -1889,12 +2289,21 @@ def main(page: ft.Page):
 
                 meal_dest = selected_meal_for_add[0]
                 db.add_food(current_user_id[0], meal_dest, name, grams, k, p, c, f, current_food_image[0])
+                extra = ""
+                if sw_fixed.value:
+                    db.save_meal(
+                        current_user_id[0], name, meal_dest,
+                        [{"name": name, "grams": grams, "kcal": k, "p": p, "c": c, "f": f,
+                          "image": current_food_image[0]}],
+                    )
+                    sw_fixed.value = False
+                    extra = " y guardado como comida fija"
                 for field in (tf_name, tf_kcal, tf_p, tf_c, tf_f):
                     field.value = ""
                 tf_grams.value = "100"
                 set_food_image(None)
                 expanded_meal[0] = meal_dest
-                notify(f"Añadido a {meal_dest}", "#3F7D58")
+                notify(f"Añadido a {meal_dest}{extra}", "#3F7D58")
                 switch_tab(0)
             except ValueError:
                 notify("Rellena los gramos y macros con números", "#B8453A")
@@ -1995,6 +2404,18 @@ def main(page: ft.Page):
                     )
                 )
 
+        def save_today_meal_as_fixed(e=None):
+            mn = selected_meal_for_add[0]
+            foods = [x for x in db.get_today_foods(current_user_id[0]) if x[1] == mn]
+            save_fixed_dialog(
+                [
+                    {"name": x[2], "grams": x[3], "kcal": x[4], "p": x[5], "c": x[6], "f": x[7], "image": x[8]}
+                    for x in foods
+                ],
+                f"{mn} habitual",
+                mn,
+            )
+
         view_add = ft.Container(
             padding=18,
             expand=True,
@@ -2021,11 +2442,19 @@ def main(page: ft.Page):
                     tf_grams,
                     ft.Row([tf_kcal, tf_p]),
                     ft.Row([tf_c, tf_f]),
+                    sw_fixed,
                     make_button("Registrar alimento", "#24543F", save_food_entry),
                     ft.Divider(color="#E4DFD3"),
                     ft.Text("Mis comidas fijas", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     ft.Text("Pulsa + para añadirlas a la comida seleccionada arriba.", size=12, color="#77736A"),
                     saved_col,
+                    make_button(
+                        "⭐ Guardar lo de hoy como comida fija", "#C9763F", save_today_meal_as_fixed,
+                    ),
+                    ft.Text(
+                        "Guarda todo lo que ya has registrado hoy en la comida seleccionada arriba.",
+                        size=11, color="#A9A59B",
+                    ),
                 ],
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -2049,6 +2478,18 @@ def main(page: ft.Page):
         ai_result_col = ft.Column(spacing=8)
         ai_suggest_col = ft.Column(spacing=10)
 
+        sw_fixed_ai = ft.Switch(label="Guardar también como comida fija", value=False)
+        tf_fixed_ai_name = ft.TextField(
+            label="Nombre de la comida fija", value="Mi comida habitual", visible=False,
+            bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3",
+        )
+
+        def toggle_fixed_ai(e=None):
+            tf_fixed_ai_name.visible = bool(sw_fixed_ai.value)
+            page.update()
+
+        sw_fixed_ai.on_change = toggle_fixed_ai
+
         def set_busy(flag, msg="Pensando…"):
             ai_loading_txt.value = msg
             ai_loading.visible = flag
@@ -2070,12 +2511,19 @@ def main(page: ft.Page):
 
         def register_ai(e=None):
             meal_dest = selected_meal_for_add[0]
-            add_items_to_log(ai_state["items"], meal_dest)
-            n = len(ai_state["items"])
+            items = list(ai_state["items"])
+            add_items_to_log(items, meal_dest)
+            extra = ""
+            if sw_fixed_ai.value:
+                nm = (tf_fixed_ai_name.value or "").strip() or "Mi comida habitual"
+                db.save_meal(current_user_id[0], nm, meal_dest, items)
+                sw_fixed_ai.value = False
+                tf_fixed_ai_name.visible = False
+                extra = " y guardada como fija"
             ai_state["items"] = []
             tf_ai.value = ""
             render_ai_items()
-            notify(f"{n} alimento(s) añadidos a {meal_dest}", "#3F7D58")
+            notify(f"{len(items)} alimento(s) añadidos a {meal_dest}{extra}", "#3F7D58")
             switch_tab(0)
 
         def render_ai_items():
@@ -2112,14 +2560,9 @@ def main(page: ft.Page):
                     content=ft.Text(f"TOTAL: {macro_line(tot)}", size=12, weight=ft.FontWeight.W_600, color="white"),
                 )
             )
+            ai_result_col.controls.append(ft.Column([sw_fixed_ai, tf_fixed_ai_name], spacing=4))
             ai_result_col.controls.append(
                 make_button(f"✅ Registrar en {selected_meal_for_add[0]}", "#3F7D58", register_ai)
-            )
-            ai_result_col.controls.append(
-                make_button(
-                    "⭐ Guardar como comida fija", "#C9763F",
-                    lambda e: save_fixed_dialog(list(ai_state["items"]), "Mi comida habitual"),
-                )
             )
             ai_result_col.controls.append(
                 make_button("Descartar", "#E4DFD3", discard_ai, text_color="#3A3832")
@@ -2151,72 +2594,227 @@ def main(page: ft.Page):
             }
             return rem, [x[2] for x in foods]
 
-        def add_suggestion(o):
-            meal_dest = selected_meal_for_add[0]
-            add_items_to_log(
-                [{"name": o["title"], "grams": o["grams"], "kcal": o["kcal"], "p": o["p"], "c": o["c"], "f": o["f"]}],
-                meal_dest,
-            )
-            notify(f"Añadido a {meal_dest}", "#3F7D58")
+        # ----- PLAN DE RECETAS PARA LLEGAR EXACTO A LAS CALORÍAS -----
+        plan_state = {"n": 0, "plans": [], "targets": [], "rem": 0, "done": set(), "switches": {}}
+        split_row = ft.Row(spacing=6, wrap=True)
+        tf_prefs = ft.TextField(
+            label="Preferencias o alergias (opcional)",
+            hint_text="Ej: sin lactosa, no me gusta el pescado, algo rápido",
+            bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3",
+        )
+        plan_loading_txt = ft.Text("Creando recetas…", size=13, color="#77736A")
+        plan_loading = ft.Row(
+            [ft.ProgressRing(width=18, height=18, stroke_width=3), plan_loading_txt], visible=False
+        )
+
+        def set_plan_busy(flag, msg="Creando recetas…"):
+            plan_loading_txt.value = msg
+            plan_loading.visible = flag
+            page.update()
+
+        def render_split_pills():
+            split_row.controls.clear()
+            for val, lbl in ((0, "Auto"), (1, "1 comida"), (2, "2 comidas"), (3, "3 comidas"), (4, "4 comidas")):
+                active = plan_state["n"] == val
+                split_row.controls.append(
+                    ft.Container(
+                        bgcolor="#24543F" if active else "#ffffff",
+                        padding=10,
+                        border_radius=10,
+                        on_click=lambda e, v=val: (
+                            plan_state.__setitem__("n", v),
+                            render_split_pills(),
+                            page.update(),
+                        ),
+                        content=ft.Text(
+                            lbl, size=12, weight=ft.FontWeight.W_600,
+                            color="white" if active else "#77736A",
+                        ),
+                    )
+                )
+
+        render_split_pills()
+
+        def pick_meal_slots(n, foods, tkcal):
+            """Qué comidas del día rellenar: la elegida (1) o las que más les falta por cubrir."""
+            if n == 1:
+                return [selected_meal_for_add[0]]
+            order = list(MEALS_META.keys())
+            deficit = {
+                m: tkcal * MEALS_META[m]["ratio"] - sum(f[4] for f in foods if f[1] == m) for m in order
+            }
+            pool = sorted([m for m in order if m != "Snacks"], key=lambda m: -deficit[m])
+            if n > len(pool):
+                pool.append("Snacks")
+            chosen = pool[:n]
+            return [m for m in order if m in chosen]
+
+        def register_plan_item(i):
+            plan = plan_state["plans"][i]
+            if plan is None or i in plan_state["done"]:
+                return
+            item = {
+                "name": plan["title"], "grams": plan["grams"], "kcal": plan["kcal"],
+                "p": plan["p"], "c": plan["c"], "f": plan["f"],
+            }
+            add_items_to_log([item], plan["meal"])
+            sw = plan_state["switches"].get(i)
+            if sw is not None and sw.value:
+                db.save_meal(current_user_id[0], plan["title"], plan["meal"], [item])
+            plan_state["done"].add(i)
+
+        def plan_pending():
+            return [i for i, p in enumerate(plan_state["plans"]) if p is not None and i not in plan_state["done"]]
+
+        def on_register_one(i):
+            plan = plan_state["plans"][i]
+            register_plan_item(i)
+            if not plan_pending():
+                notify(f"Añadido a {plan['meal']}", "#3F7D58")
+                switch_tab(0)
+            else:
+                render_plan()
+                notify(f"Añadido a {plan['meal']}", "#3F7D58")
+
+        def on_register_all(e=None):
+            pending = plan_pending()
+            for i in pending:
+                register_plan_item(i)
+            notify(f"{len(pending)} comida(s) añadidas", "#3F7D58")
             switch_tab(0)
 
-        def render_suggestions(options, rem_kcal):
-            ai_suggest_col.controls.clear()
-            if not options:
-                ai_suggest_col.controls.append(
-                    ft.Text("La IA no encontró opciones que encajen sin pasarte. Inténtalo de nuevo.", size=12, color="#77736A")
+        def render_plan():
+            plans, targets, R = plan_state["plans"], plan_state["targets"], plan_state["rem"]
+            plan_state["switches"] = {}
+            col = ai_suggest_col
+            col.controls.clear()
+            ok = [p for p in plans if p]
+            tot = {k: sum(p[k] for p in ok) for k in ("kcal", "p", "c", "f")}
+            n = len(targets)
+            col.controls.append(
+                ft.Container(
+                    bgcolor="#1C1B18", border_radius=12, padding=14,
+                    content=ft.Column(
+                        [
+                            ft.Text(
+                                f"Te quedan {R} kcal · plan de {n} comida{'s' if n > 1 else ''}",
+                                size=13, weight=ft.FontWeight.W_600, color="white",
+                            ),
+                            ft.Text(
+                                f"Cada comida cuadra con su objetivo (margen ±{PLAN_TOLERANCE} kcal).",
+                                size=11, color="#A9A59B",
+                            ),
+                            ft.Text(f"Plan completo: {macro_line(tot)}", size=11, color="#E3B965"),
+                        ],
+                        spacing=3,
+                    ),
                 )
-                return
-            ai_suggest_col.controls.append(
-                ft.Text(f"Te quedan {int(rem_kcal)} kcal. Todas estas opciones caben sin pasarte:", size=12, color="#77736A")
             )
-            for o in options:
-                steps = "\n".join(f"{i + 1}. {st}" for i, st in enumerate(o["steps"]))
-                ai_suggest_col.controls.append(
+            for i, (plan, tgt) in enumerate(zip(plans, targets)):
+                if plan is None:
+                    col.controls.append(
+                        ft.Container(
+                            bgcolor="#ffffff", border_radius=12, padding=14, border=CARD_BORDER,
+                            content=ft.Text(
+                                f"{tgt['meal']}: no pude ajustar una receta a {tgt['kcal']} kcal. "
+                                "Pulsa «Generar otro plan».",
+                                size=12, color="#B8453A",
+                            ),
+                        )
+                    )
+                    continue
+                within = abs(plan["kcal"] - plan["target_kcal"]) <= PLAN_TOLERANCE
+                ings = "\n".join(f"• {x['grams']} g {x['name']}" for x in plan["ingredients"])
+                steps = "\n".join(f"{k + 1}. {st}" for k, st in enumerate(plan["steps"]))
+                if i in plan_state["done"]:
+                    action = ft.Container(
+                        bgcolor="#E3ECE6", border_radius=10, padding=10,
+                        content=ft.Row(
+                            [
+                                ft.Icon(ft.Icons.CHECK, size=18, color="#24543F"),
+                                ft.Text(f"Registrada en {plan['meal']}", size=13, weight=ft.FontWeight.W_600, color="#24543F"),
+                            ],
+                            alignment=ft.MainAxisAlignment.CENTER,
+                        ),
+                    )
+                else:
+                    sw = ft.Switch(label="Guardar también como comida fija", value=False)
+                    plan_state["switches"][i] = sw
+                    action = ft.Column(
+                        [sw, make_button(f"➕ Registrar en {plan['meal']}", "#3F7D58", lambda e, k=i: on_register_one(k))],
+                        spacing=4,
+                    )
+                col.controls.append(
                     ft.Container(
                         bgcolor="#ffffff", border_radius=12, padding=14, shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Column(
                             [
-                                ft.Text(o["title"], size=15, weight=ft.FontWeight.W_600, color="#1C1B18"),
-                                ft.Text(o["description"], size=12, color="#77736A"),
-                                ft.Text(macro_line(o), size=12, weight=ft.FontWeight.W_600, color="#24543F"),
-                                ft.Text("Ingredientes: " + ", ".join(o["ingredients"]), size=11, color="#3A3832") if o["ingredients"] else ft.Container(),
-                                ft.Text(steps, size=11, color="#5A574F") if steps else ft.Container(),
                                 ft.Row(
                                     [
-                                        make_button("➕ Registrar", "#3F7D58", lambda e, oo=o: add_suggestion(oo), expand=True),
-                                        make_button(
-                                            "⭐ Guardar", "#C9763F",
-                                            lambda e, oo=o: save_fixed_dialog(
-                                                [{"name": oo["title"], "grams": oo["grams"], "kcal": oo["kcal"], "p": oo["p"], "c": oo["c"], "f": oo["f"]}],
-                                                oo["title"],
-                                            ),
-                                            expand=True,
+                                        ft.Container(
+                                            bgcolor="#E3ECE6", border_radius=8,
+                                            padding=ft.Padding(left=8, right=8, top=3, bottom=3),
+                                            content=ft.Text(plan["meal"].upper(), size=10, weight=ft.FontWeight.W_600, color="#24543F"),
+                                        ),
+                                        ft.Text(
+                                            f"{plan['kcal']} / {plan['target_kcal']} kcal",
+                                            size=12, weight=ft.FontWeight.W_600,
+                                            color="#3F7D58" if within else "#C9763F",
                                         ),
                                     ],
-                                    spacing=8,
+                                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
                                 ),
+                                ft.Text(plan["title"], size=15, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                ft.Text(plan["description"], size=12, color="#77736A") if plan["description"] else ft.Container(),
+                                ft.Text(macro_line(plan), size=12, weight=ft.FontWeight.W_600, color="#24543F"),
+                                ft.Text("Ingredientes", size=11, weight=ft.FontWeight.W_600, color="#77736A"),
+                                ft.Text(ings, size=12, color="#3A3832"),
+                                ft.Text(steps, size=11, color="#5A574F") if steps else ft.Container(),
+                                action,
                             ],
                             spacing=6,
                         ),
                     )
                 )
+            if len(plan_pending()) > 1:
+                col.controls.append(make_button("✅ Registrar todo el plan", "#24543F", on_register_all))
+            col.controls.append(
+                make_button("🔄 Generar otro plan", "#E4DFD3", run_suggestions, text_color="#3A3832")
+            )
 
         async def run_suggestions(e=None):
+            u = db.get_user(current_user_id[0])
+            foods = db.get_today_foods(current_user_id[0])
             rem, eaten = today_remaining()
-            if rem["kcal"] < 60:
-                ai_suggest_col.controls = [ft.Text("Ya has llegado a tus calorías de hoy.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600)]
+            R = int(round(rem["kcal"]))
+            if R < 60:
+                ai_suggest_col.controls = [
+                    ft.Text("Ya has llegado a tus calorías de hoy.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600)
+                ]
                 page.update()
                 return
-            set_busy(True, "Buscando opciones para ti…")
+            # Si no cabe en una comida (> MAX_MEAL_KCAL) se reparte en varias; Auto decide cuántas.
+            n = plan_state["n"] or math.ceil(R / MAX_MEAL_KCAL)
+            n = max(1, min(4, n, R // MIN_MEAL_KCAL))
+            slots = pick_meal_slots(n, foods, u[10])
+            kcals = split_calories(R, n)
+            targets = [
+                {
+                    "meal": slots[i], "kcal": kcals[i],
+                    "p": round(rem["p"] / n), "c": round(rem["c"] / n), "f": round(rem["f"] / n),
+                }
+                for i in range(n)
+            ]
+            set_plan_busy(True, f"Creando {n} receta{'s' if n > 1 else ''} de ~{kcals[0]} kcal…")
             try:
-                options = await asyncio.to_thread(ai_suggest, rem, eaten, selected_meal_for_add[0])
+                plans = await asyncio.to_thread(ai_plan, targets, eaten, (tf_prefs.value or "").strip())
             except Exception as ex:
-                set_busy(False)
+                set_plan_busy(False)
                 notify(f"IA: {ex}", "#B8453A")
                 return
-            render_suggestions(options, rem["kcal"])
-            set_busy(False)
+            plan_state.update(plans=plans, targets=targets, rem=R, done=set())
+            render_plan()
+            set_plan_busy(False)
 
         async def go_suggestions(e=None):
             switch_tab(2)
@@ -2238,8 +2836,16 @@ def main(page: ft.Page):
                     ai_result_col,
                     ft.Divider(color="#E4DFD3"),
                     ft.Text("Completar el día", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
-                    ft.Text("Si te faltan calorías, propone opciones y recetas sin pasarte.", size=12, color="#77736A"),
-                    make_button("Ver opciones para llegar", "#24543F", run_suggestions),
+                    ft.Text(
+                        f"Te creo recetas para llegar justo a tus calorías de hoy (±{PLAN_TOLERANCE} kcal por comida). "
+                        "Si son demasiadas para una sola comida, las reparto en varias.",
+                        size=12, color="#77736A",
+                    ),
+                    ft.Text("Repartir en:", size=12, weight=ft.FontWeight.W_600, color="#77736A"),
+                    split_row,
+                    tf_prefs,
+                    make_button("Generar plan de recetas", "#24543F", run_suggestions),
+                    plan_loading,
                     ai_suggest_col,
                 ],
                 scroll=ft.ScrollMode.AUTO,
@@ -2258,115 +2864,91 @@ def main(page: ft.Page):
 
         camera_holder = ft.Container(visible=False)
 
-        def process_code_string(code_str):
+        def parse_qr_json(code_str):
+            try:
+                data = json.loads(code_str)
+                if isinstance(data, dict) and all(k in data for k in ("name", "kcal", "p", "c", "f")):
+                    return data
+            except Exception:
+                pass
+            return None
+
+        async def process_code_string(code_str):
             code_str = (code_str or "").strip()
             if not code_str:
                 notify("Introduce o escanea un código primero", "#B8453A")
                 return
-
-            try:
-                data = json.loads(code_str)
-                if all(k in data for k in ("name", "kcal", "p", "c", "f")):
-                    fill_food_form(
-                        data["name"], data["kcal"], data["p"], data["c"], data["f"]
-                    )
-                    return
-            except Exception:
-                pass
-
-            if code_str.isdigit():
-                try:
-                    url = f"https://world.openfoodfacts.org/api/v0/product/{code_str}.json"
-                    resp = requests.get(url, headers=OFF_HEADERS, timeout=6).json()
-                    if resp.get("status") == 1:
-                        prod = resp["product"]
-                        name = prod.get("product_name") or "Producto Escaneado"
-                        nutr = prod.get("nutriments", {})
-                        fill_food_form(
-                            name,
-                            nutr.get("energy-kcal_100g", 0),
-                            nutr.get("proteins_100g", 0),
-                            nutr.get("carbohydrates_100g", 0),
-                            nutr.get("fat_100g", 0),
-                            prod.get("image_front_url") or prod.get("image_url"),
-                        )
-                        return
-                    else:
-                        notify("Código no encontrado en OpenFoodFacts", "#B8453A")
-                except Exception:
-                    notify("Error al conectar con OpenFoodFacts", "#B8453A")
-            else:
+            data = parse_qr_json(code_str)
+            if data:
+                fill_food_form(data["name"], data["kcal"], data["p"], data["c"], data["f"])
+                return
+            if not code_str.isdigit():
                 notify("Formato de código no reconocido", "#B8453A")
-
-        scan_state = {"active": False}
-
-        def decode_frame(image_bytes):
-            """Devuelve el texto de un QR o código de barras, o '' si no hay."""
-            nparr = np.frombuffer(image_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            if img is None:
-                return ""
-            # 1) QR
+                return
+            notify("Buscando producto…", "#24543F")
             try:
-                data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
-                if data:
-                    return data
+                prod = await asyncio.to_thread(lookup_product, code_str)
             except Exception:
-                pass
-            # 2) Código de barras EAN/UPC (si tu OpenCV lo incluye)
-            try:
-                bd = cv2.barcode.BarcodeDetector()
-                ok, infos, _, _ = bd.detectAndDecodeWithType(img)
-                if ok:
-                    for d in infos:
-                        if d:
-                            return d
-            except Exception:
-                pass
-            return ""
+                notify("Error al conectar con OpenFoodFacts", "#B8453A")
+                return
+            if not prod:
+                notify("Código no encontrado en OpenFoodFacts", "#B8453A")
+                return
+            fill_food_form(prod["name"], prod["kcal"], prod["p"], prod["c"], prod["f"], prod["image"])
+
+        async def search_barcode(e=None):
+            await process_code_string(tf_barcode.value)
+
+        scan_state = {"active": False, "gen": 0}
+        has_cv_barcode, has_zbar = barcode_engines()
 
         def close_camera_inline(ev=None):
             scan_state["active"] = False
+            scan_state["gen"] += 1  # invalida cualquier bucle de escaneo en marcha
             camera_holder.visible = False
             camera_holder.content = None
             page.update()
 
         async def open_camera_inline(e):
+            if not (has_cv_barcode or has_zbar):
+                notify(
+                    "Este servidor no lee códigos de barras (falta OpenCV ≥ 4.8 o pyzbar). Escribe el número.",
+                    "#B8453A",
+                )
             try:
                 cam = fc.Camera(expand=True, preview_enabled=True)
             except Exception as ex:
                 notify(f"Cámara no disponible: {ex}", "#B8453A")
                 return
 
-            async def capture_and_decode(ev=None):
-                try:
-                    image_bytes = await cam.take_picture()
-                    if not image_bytes:
-                        return False
-                    data = decode_frame(image_bytes)
-                    if data:
-                        scan_state["active"] = False
-                        tf_barcode.value = data
-                        close_camera_inline()
-                        process_code_string(data)
-                        return True
-                except Exception as ex:
-                    print("Error captura:", ex)
-                return False
-
-            async def manual_capture(ev):
-                ok = await capture_and_decode()
-                if not ok:
-                    notify("No se detectó ningún código. Acércalo más.", "#C9763F")
+            scan_state["gen"] += 1
+            my_gen = scan_state["gen"]
+            status_lbl = ft.Text("Apunta al código: se leerá solo, sin pulsar nada", size=12, color="#77736A")
 
             async def auto_scan_loop():
-                import asyncio
+                if scan_state["gen"] != my_gen:
+                    return
                 scan_state["active"] = True
-                await asyncio.sleep(1.0)
-                while scan_state["active"]:
-                    if await capture_and_decode():
-                        break
-                    await asyncio.sleep(0.7)
+                await asyncio.sleep(0.8)
+                tries = 0
+                while scan_state["active"] and scan_state["gen"] == my_gen:
+                    tries += 1
+                    try:
+                        image_bytes = await cam.take_picture()
+                        if image_bytes:
+                            # La decodificación va en otro hilo para no congelar la pantalla
+                            data = await asyncio.to_thread(decode_frame, image_bytes)
+                            if data and scan_state["active"] and scan_state["gen"] == my_gen:
+                                tf_barcode.value = data
+                                close_camera_inline()
+                                await process_code_string(data)
+                                return
+                    except Exception as ex:
+                        print("Error escaneo:", ex)
+                    if tries == 12 and scan_state["gen"] == my_gen:
+                        status_lbl.value = "Aún nada… prueba a acercar o alejar el código, con buena luz y recto"
+                        page.update()
+                    await asyncio.sleep(0.35)
 
             camera_holder.content = ft.Container(
                 bgcolor="#ffffff",
@@ -2382,18 +2964,8 @@ def main(page: ft.Page):
                             clip_behavior=ft.ClipBehavior.HARD_EDGE,
                             content=cam,
                         ),
-                        ft.Text(
-                            "Escaneando automáticamente… apunta al código",
-                            size=12,
-                            color="#77736A",
-                        ),
-                        ft.Row(
-                            [
-                                make_button("📸 Capturar", "#24543F", manual_capture, expand=True),
-                                make_button("✖ Cerrar", "#B8453A", close_camera_inline, expand=True),
-                            ],
-                            spacing=10,
-                        ),
+                        status_lbl,
+                        make_button("✖ Cerrar", "#B8453A", close_camera_inline),
                     ],
                     spacing=10,
                 ),
@@ -2447,7 +3019,7 @@ def main(page: ft.Page):
                                     color="#1C1B18",
                                 ),
                                 ft.Text(
-                                    "Abre la cámara integrada para leer un código QR nutricional o escribe el código de barras debajo.",
+                                    "Abre la cámara y apunta al código de barras o QR: se detecta solo, sin pulsar capturar. También puedes escribir el número debajo.",
                                     text_align="center",
                                     color="#77736A",
                                     size=13,
@@ -2467,11 +3039,7 @@ def main(page: ft.Page):
                         size=13,
                     ),
                     tf_barcode,
-                    make_button(
-                        "Buscar producto",
-                        "#3F7D58",
-                        lambda e: process_code_string(tf_barcode.value),
-                    ),
+                    make_button("Buscar producto", "#3F7D58", search_barcode),
                 ],
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -2486,7 +3054,14 @@ def main(page: ft.Page):
             u = db.get_user(current_user_id[0])
             if not u:
                 return
-            uid, uname, uav, uw, uh, uage, ugen, uact, ugoal, _, ukcal, up, uc, uf, _ = u
+            uid, uname, uav, uw, uh, uage, ugen, uact, ugoal, uoff, ukcal, up, uc, uf, _ = u
+            act_txt, act_mult = db.get_activity_extra(uid)
+            act_label = f"{uact} (×{act_mult:.2f})" if act_mult else uact
+            act_note = (
+                ft.Text(f"“{act_txt}”", size=12, color="#77736A", italic=True, text_align="center")
+                if act_txt
+                else ft.Container()
+            )
             profile_summary_col.controls = [
                 ft.Container(
                     bgcolor="#ffffff",
@@ -2504,11 +3079,12 @@ def main(page: ft.Page):
                             ),
                             ft.Divider(color="#F4F1EA"),
                             ft.Text(
-                                f"Actividad: {uact}  |  Objetivo: {ugoal}",
+                                f"Actividad: {act_label}  |  Objetivo: {ugoal} ({(uoff or 0):+.0f} kcal)",
                                 size=13,
                                 weight=ft.FontWeight.W_600,
                                 color="#24543F",
                             ),
+                            act_note,
                             ft.Text(
                                 f"Meta diaria: {int(ukcal)} kcal (P: {int(up)}g • C: {int(uc)}g • G: {int(uf)}g)",
                                 size=13,
