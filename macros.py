@@ -326,7 +326,58 @@ def estimate_exercise_kcal(weight, height, age, gender, mult):
     return max(0, round(compute_bmr(weight, height, age, gender) * (mult - 1.2)))
 
 
-def compute_macros(weight, height, age, gender, activity, goal_name, offset=None, act_mult=None):
+# Repartos de macronutrientes (% de las kcal: proteína, carbohidratos, grasas).
+# Valores orientativos basados en la literatura; no sustituyen a un dietista.
+MACRO_PRESETS = {
+    "auto": {
+        "name": "Automático",
+        "split": None,
+        "desc": "2 g/kg de proteína, 0,9 g/kg de grasa y el resto en carbohidratos.",
+        "ref": "Morton et al., 2018 (Br J Sports Med); Jäger et al., 2017 (ISSN)",
+    },
+    "amdr": {
+        "name": "Equilibrado",
+        "split": (20, 50, 30),
+        "desc": "Reparto dentro de los rangos recomendados para adultos sanos.",
+        "ref": "IOM/NAM, Dietary Reference Intakes, 2005: P 10-35 %, C 45-65 %, G 20-35 %",
+    },
+    "cut": {
+        "name": "Definición",
+        "split": (35, 40, 25),
+        "desc": "Más proteína para conservar el músculo mientras estás en déficit.",
+        "ref": "Helms et al., 2014 (JISSN); Morton et al., 2018",
+    },
+    "bulk": {
+        "name": "Volumen",
+        "split": (25, 50, 25),
+        "desc": "Carbohidratos altos para rendir y recuperar mejor en superávit.",
+        "ref": "Burke et al., 2011 (J Sports Sci); Kerksick et al., 2018 (ISSN)",
+    },
+    "lowcarb": {
+        "name": "Low carb",
+        "split": (30, 25, 45),
+        "desc": "Menos carbohidratos y más grasa; buena saciedad si te sienta bien.",
+        "ref": "Hall & Guo, 2017 (Gastroenterology): a igual proteína y kcal, la diferencia en pérdida de grasa es pequeña",
+    },
+    "custom": {
+        "name": "Personalizado",
+        "split": None,
+        "desc": "Elige tú el porcentaje de proteína y carbohidratos; la grasa es lo que sobra.",
+        "ref": "Referencia de rangos: IOM/NAM, 2005",
+    },
+}
+
+
+def recommended_preset(offset):
+    """Preset sugerido según el ajuste calórico del objetivo."""
+    if offset <= -50:
+        return "cut"
+    if offset >= 50:
+        return "bulk"
+    return "amdr"
+
+
+def compute_macros(weight, height, age, gender, activity, goal_name, offset=None, act_mult=None, split=None):
     bmr = compute_bmr(weight, height, age, gender)
     mult = activity_multiplier(activity, act_mult)
     if offset is None:
@@ -334,9 +385,16 @@ def compute_macros(weight, height, age, gender, activity, goal_name, offset=None
 
     tdee = bmr * mult
     target_kcal = max(1200.0, round(tdee + offset))
-    target_p = round(weight * 2.0)  # 2.0g/kg proteína
-    target_f = round(weight * 0.9)  # 0.9g/kg grasas
-    target_c = max(0.0, round((target_kcal - (target_p * 4) - (target_f * 9)) / 4))
+    if split:
+        # Reparto por porcentajes de las kcal totales (P, C, G)
+        pp, pc, pf = split
+        target_p = round(target_kcal * pp / 100.0 / 4)
+        target_c = round(target_kcal * pc / 100.0 / 4)
+        target_f = round(target_kcal * pf / 100.0 / 9)
+    else:
+        target_p = round(weight * 2.0)  # 2.0g/kg proteína
+        target_f = round(weight * 0.9)  # 0.9g/kg grasas
+        target_c = max(0.0, round((target_kcal - (target_p * 4) - (target_f * 9)) / 4))
 
     return target_kcal, target_p, target_c, target_f, offset
 
@@ -946,13 +1004,13 @@ def main(page: ft.Page):
                     ft.Container(height=20),
                     ft.Text("PERFILES", size=11, color="#77736A", weight=ft.FontWeight.W_600),
                     ft.Text(
-                        "¿Quién entrena hoy?",
+                        "Elige tu perfil",
                         size=28,
                         weight=ft.FontWeight.W_600,
                         color="#1C1B18",
                     ),
                     ft.Text(
-                        "Elige un perfil o crea uno nuevo.",
+                        "Toca tu perfil para entrar o crea uno nuevo.",
                         size=13,
                         color="#77736A",
                     ),
@@ -963,7 +1021,11 @@ def main(page: ft.Page):
                         "#24543F",
                         lambda e: show_onboarding_wizard(is_first_user=False),
                     ),
-                    ft.Container(height=12),
+                    ft.Container(
+                        alignment=ft.Alignment.CENTER,
+                        content=ft.Text("Creado por ismael_prd", size=11, color="#A9A59B"),
+                    ),
+                    ft.Container(height=8),
                 ],
                 expand=True,
                 spacing=8,
@@ -1008,7 +1070,21 @@ def main(page: ft.Page):
             "act_kcal": None,
             "act_summary": "",
             "act_busy": False,
+            # Reparto de macros (porcentajes): preset elegido o personalizado
+            "macro_preset": None,  # None = sugerido según el objetivo
+            "split_p": 30,
+            "split_c": 40,
         }
+
+        def current_preset():
+            return wiz_state["macro_preset"] or recommended_preset(wiz_state["offset"])
+
+        def current_split():
+            key = current_preset()
+            if key == "custom":
+                p, c = wiz_state["split_p"], wiz_state["split_c"]
+                return (p, c, 100 - p - c)
+            return MACRO_PRESETS[key]["split"]
 
         AVATARS = ["💪", "🔥", "⚡", "🏋️", "🧘", "🏃", "🥗", "🏆"]
 
@@ -1357,12 +1433,30 @@ def main(page: ft.Page):
                 lbl_tc = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#E3B965")
                 lbl_tp = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#3F7D58")
                 lbl_tf = ft.Text("", size=18, weight=ft.FontWeight.W_600, color="#C9763F")
+                lbl_split = ft.Text("", size=12, color="#A9A59B")
+                lbl_pkg = ft.Text("", size=12, color="#A9A59B")
+                lbl_macro_warn = ft.Text("", size=12, color="#B8453A", visible=False)
 
                 def refresh_goal():
                     off = wiz_state["offset"]
                     tkcal, tp, tc, tf, _ = compute_macros(
-                        w_, h_, a_, g_, wiz_state["activity"], "", offset=off, act_mult=wiz_state["act_mult"]
+                        w_, h_, a_, g_, wiz_state["activity"], "", offset=off,
+                        act_mult=wiz_state["act_mult"], split=current_split(),
                     )
+                    pct_p = round(tp * 4 * 100 / tkcal) if tkcal else 0
+                    pct_c = round(tc * 4 * 100 / tkcal) if tkcal else 0
+                    pct_f = max(0, 100 - pct_p - pct_c)
+                    lbl_split.value = f"Carbos {pct_c}% • Proteína {pct_p}% • Grasas {pct_f}%"
+                    lbl_pkg.value = f"Proteína: {tp / w_:.1f} g/kg • Grasas: {tf / w_:.1f} g/kg"
+                    warns = []
+                    if pct_f < 20:
+                        warns.append("Grasa por debajo del 20 %: fuera del rango recomendado (IOM, 2005).")
+                    if tp / w_ < 1.4:
+                        warns.append("Proteína por debajo de 1,4 g/kg: baja para quien entrena fuerza.")
+                    if tp / w_ > 3.0:
+                        warns.append("Proteína por encima de 3 g/kg: no hay beneficio extra demostrado.")
+                    lbl_macro_warn.value = " ".join(warns)
+                    lbl_macro_warn.visible = bool(warns)
                     title, color, advice = describe_offset(off)
                     lbl_goal.value = title
                     lbl_goal.color = color
@@ -1389,7 +1483,11 @@ def main(page: ft.Page):
                     lbl_warn.visible = bool(lbl_warn.value)
 
                 def on_slide(e):
+                    old_rec = recommended_preset(wiz_state["offset"])
                     wiz_state["offset"] = float(round(float(e.control.value) / 50.0) * 50)
+                    if wiz_state["macro_preset"] is None and recommended_preset(wiz_state["offset"]) != old_rec:
+                        render_wizard_step()  # cambia el preset sugerido: redibuja la tarjeta
+                        return
                     refresh_goal()
                     page.update()
 
@@ -1437,6 +1535,90 @@ def main(page: ft.Page):
                     ),
                 )
 
+                # ---- Reparto de macros según objetivo (con referencia bibliográfica) ----
+                def set_preset(key):
+                    wiz_state["macro_preset"] = key
+                    render_wizard_step()
+
+                active_key = current_preset()
+                rec_key = recommended_preset(wiz_state["offset"])
+
+                def preset_chip(key):
+                    meta = MACRO_PRESETS[key]
+                    sel = key == active_key
+                    label = meta["name"] + (" ★" if key == rec_key else "")
+                    return ft.Container(
+                        bgcolor="#24543F" if sel else "#ffffff",
+                        border=CARD_BORDER,
+                        border_radius=10,
+                        padding=ft.Padding(left=12, right=12, top=9, bottom=9),
+                        on_click=lambda e, k=key: set_preset(k),
+                        content=ft.Text(
+                            label, size=12, weight=ft.FontWeight.W_600,
+                            color="#ffffff" if sel else "#24543F",
+                        ),
+                    )
+
+                lbl_custom = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#3A3832")
+
+                def refresh_custom_lbl():
+                    p, c = wiz_state["split_p"], wiz_state["split_c"]
+                    lbl_custom.value = f"Proteína {p}% • Carbos {c}% • Grasas {100 - p - c}%"
+
+                def on_slide_p(e):
+                    p = int(round(float(e.control.value)))
+                    wiz_state["split_p"] = p
+                    if wiz_state["split_c"] > 90 - p:  # deja siempre un 10 % mínimo para grasa
+                        wiz_state["split_c"] = 90 - p
+                    refresh_custom_lbl()
+                    refresh_goal()
+                    page.update()
+
+                def on_slide_c(e):
+                    c = int(round(float(e.control.value)))
+                    wiz_state["split_c"] = min(c, 90 - wiz_state["split_p"])
+                    refresh_custom_lbl()
+                    refresh_goal()
+                    page.update()
+
+                refresh_custom_lbl()
+                custom_box = ft.Column(
+                    [
+                        lbl_custom,
+                        ft.Text("Proteína (%)", size=11, color="#A9A59B"),
+                        ft.Slider(min=10, max=50, divisions=40, value=wiz_state["split_p"],
+                                  label="{value} %", on_change=on_slide_p),
+                        ft.Text("Carbohidratos (%)", size=11, color="#A9A59B"),
+                        ft.Slider(min=5, max=70, divisions=65, value=wiz_state["split_c"],
+                                  label="{value} %", on_change=on_slide_c),
+                    ],
+                    spacing=2,
+                    visible=(active_key == "custom"),
+                )
+
+                macro_card = ft.Container(
+                    bgcolor="#ffffff", border_radius=14, padding=16, shadow=CARD_SHADOW, border=CARD_BORDER,
+                    content=ft.Column(
+                        [
+                            ft.Text("Reparto de macros", size=16, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                            ft.Text(
+                                "★ = recomendado para tu objetivo. Toca otro para cambiarlo.",
+                                size=12, color="#77736A",
+                            ),
+                            ft.Row([preset_chip(k) for k in MACRO_PRESETS], spacing=8, run_spacing=8, wrap=True),
+                            ft.Text(MACRO_PRESETS[active_key]["desc"], size=13, color="#3A3832"),
+                            ft.Text("Ref.: " + MACRO_PRESETS[active_key]["ref"], size=11, color="#A9A59B", italic=True),
+                            custom_box,
+                            lbl_macro_warn,
+                            ft.Text(
+                                "Valores orientativos; no sustituyen el consejo de un dietista o médico.",
+                                size=11, color="#A9A59B",
+                            ),
+                        ],
+                        spacing=6,
+                    ),
+                )
+
                 summary_card = ft.Container(
                     bgcolor="#1C1B18",
                     padding=20,
@@ -1458,11 +1640,15 @@ def main(page: ft.Page):
                                 ],
                                 alignment=ft.MainAxisAlignment.SPACE_AROUND,
                             ),
+                            lbl_split,
+                            lbl_pkg,
                         ],
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                         spacing=6,
                     ),
                 )
+
+                refresh_goal()  # ya existen todas las etiquetas (porcentajes, g/kg, avisos)
 
                 wiz_body.content = ft.Column(
                     [
@@ -1476,6 +1662,7 @@ def main(page: ft.Page):
                             [quick_chip("Definición −400", -400), quick_chip("Mantener 0", 0), quick_chip("Volumen +350", 350)],
                             spacing=8, wrap=True,
                         ),
+                        macro_card,
                         summary_card,
                     ],
                     scroll=ft.ScrollMode.AUTO,
@@ -1588,6 +1775,7 @@ def main(page: ft.Page):
                 "",
                 offset=float(wiz_state["offset"]),
                 act_mult=wiz_state["act_mult"],
+                split=current_split(),
             )
             goal_name = describe_offset(offset)[0]
             mult = activity_multiplier(wiz_state["activity"], wiz_state["act_mult"])
@@ -3106,6 +3294,10 @@ def main(page: ft.Page):
                     "Cambiar de perfil",
                     "#3A3832",
                     show_user_selector,
+                ),
+                ft.Container(
+                    alignment=ft.Alignment.CENTER,
+                    content=ft.Text("Creado por ismael_prd", size=11, color="#A9A59B"),
                 ),
             ]
             page.update()
