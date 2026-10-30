@@ -263,17 +263,17 @@ class DatabaseManager:
 # FÓRMULA HARRIS-BENEDICT Y MACROS
 # ==========================================
 ACT_MULTIPLIERS = {
-    "Sedentario": {"mult": 1.2, "desc": "Poco o ningún ejercicio", "icon": "🛋️"},
-    "Ligero": {"mult": 1.375, "desc": "Entreno suave 1-3 días/sem", "icon": "🚶"},
-    "Moderado": {"mult": 1.55, "desc": "Gimnasio 3-5 días/sem", "icon": "🏋️"},
-    "Intenso": {"mult": 1.725, "desc": "Entreno fuerte 6-7 días/sem", "icon": "🔥"},
-    "Atleta": {"mult": 1.9, "desc": "Doble sesión o trabajo físico", "icon": "🏆"},
+    "Sedentario": {"mult": 1.2, "desc": "Poco o ningún ejercicio", "icon": ft.Icons.WEEKEND_OUTLINED},
+    "Ligero": {"mult": 1.375, "desc": "Entreno suave 1-3 días/sem", "icon": ft.Icons.DIRECTIONS_WALK},
+    "Moderado": {"mult": 1.55, "desc": "Gimnasio 3-5 días/sem", "icon": ft.Icons.FITNESS_CENTER},
+    "Intenso": {"mult": 1.725, "desc": "Entreno fuerte 6-7 días/sem", "icon": ft.Icons.LOCAL_FIRE_DEPARTMENT_OUTLINED},
+    "Atleta": {"mult": 1.9, "desc": "Doble sesión o trabajo físico", "icon": ft.Icons.EMOJI_EVENTS_OUTLINED},
 }
 
 GOALS_META = {
-    "Definición": {"offset": -400.0, "desc": "Perder grasa (-400 kcal)", "icon": "⚡"},
-    "Mantenimiento": {"offset": 0.0, "desc": "Mantener peso (0 kcal)", "icon": "⚖️"},
-    "Volumen": {"offset": 350.0, "desc": "Ganar músculo (+350 kcal)", "icon": "💪"},
+    "Definición": {"offset": -400.0, "desc": "Perder grasa (-400 kcal)", "icon": ft.Icons.TRENDING_DOWN},
+    "Mantenimiento": {"offset": 0.0, "desc": "Mantener peso (0 kcal)", "icon": ft.Icons.BALANCE},
+    "Volumen": {"offset": 350.0, "desc": "Ganar músculo (+350 kcal)", "icon": ft.Icons.TRENDING_UP},
 }
 
 
@@ -419,13 +419,46 @@ def ai_suggest(remaining, eaten_names, meal_name):
     return options
 
 
+BTN_ICONS = {
+    "➕": ft.Icons.ADD, "✅": ft.Icons.CHECK, "⭐": ft.Icons.STAR_OUTLINE,
+    "🔍": ft.Icons.SEARCH, "📸": ft.Icons.PHOTO_CAMERA_OUTLINED, "✖": ft.Icons.CLOSE,
+    "⬅": ft.Icons.ARROW_BACK, "➡": ft.Icons.ARROW_FORWARD, "💡": ft.Icons.LIGHTBULB_OUTLINE,
+    "✨": ft.Icons.AUTO_AWESOME_OUTLINED, "⚡": ft.Icons.TUNE, "👥": ft.Icons.SWAP_HORIZ,
+    "🚀": ft.Icons.CHECK,
+}
+
+
+def split_btn_icon(text):
+    """Separa un posible emoji inicial/final del texto y lo cambia por un icono."""
+    t = (text or "").replace("\ufe0f", "").strip()
+    for em, ic in BTN_ICONS.items():
+        if t.startswith(em):
+            return ic, t[len(em):].strip(), False
+        if t.endswith(em):
+            return ic, t[: -len(em)].strip(), True
+    return None, t, False
+
+
+def avatar_chip(name, size=44):
+    initial = (name or "?").strip()[:1].upper() or "?"
+    return ft.Container(
+        width=size,
+        height=size,
+        border_radius=size * 0.3,
+        bgcolor="#E3ECE6",
+        alignment=ft.Alignment.CENTER,
+        content=ft.Text(initial, size=size * 0.42, weight=ft.FontWeight.W_600, color="#24543F"),
+    )
+
+
 def food_thumb(url, size=44):
     placeholder = ft.Container(
         width=size,
         height=size,
         border_radius=10,
-        bgcolor="#f1f5f9",
-        content=ft.Row([ft.Text("🍽️", size=size * 0.5)], alignment=ft.MainAxisAlignment.CENTER),
+        bgcolor="#F4F1EA",
+        alignment=ft.Alignment.CENTER,
+        content=ft.Icon(ft.Icons.RESTAURANT, size=size * 0.4, color="#A9A59B"),
     )
     if not url:
         return placeholder
@@ -445,9 +478,10 @@ def food_thumb(url, size=44):
 def main(page: ft.Page):
     db = DatabaseManager(os.getenv("DB_PATH", "gym_macros_mobile.db"))
 
-    page.title = "GymMacro Pro"
+    page.title = "GymMacro"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.bgcolor = "#f1f5f9"
+    page.bgcolor = "#F4F1EA"
+    page.theme = ft.Theme(color_scheme=ft.ColorScheme(primary="#24543F"))
     page.padding = 0
 
     try:
@@ -460,9 +494,8 @@ def main(page: ft.Page):
         "User-Agent": "GymMacroProApp - Mobile - Version 3.0"
     }
 
-    CARD_SHADOW = ft.BoxShadow(
-        spread_radius=0, blur_radius=18, color="#14000000"
-    )
+    CARD_SHADOW = None  # tarjetas planas: solo borde fino
+    CARD_BORDER = ft.Border.all(1, "#E4DFD3")
 
     # Estado global de sesión
     current_user_id = [None]
@@ -470,22 +503,22 @@ def main(page: ft.Page):
     expanded_meal = [None]
 
     MEALS_META = {
-        "Desayuno": {"icon": "☕", "ratio": 0.30},
-        "Almuerzo": {"icon": "🥪", "ratio": 0.40},
-        "Cena": {"icon": "🥗", "ratio": 0.25},
-        "Snacks": {"icon": "🍎", "ratio": 0.05},
+        "Desayuno": {"icon": ft.Icons.FREE_BREAKFAST_OUTLINED, "ratio": 0.30},
+        "Almuerzo": {"icon": ft.Icons.LUNCH_DINING_OUTLINED, "ratio": 0.40},
+        "Cena": {"icon": ft.Icons.DINNER_DINING_OUTLINED, "ratio": 0.25},
+        "Snacks": {"icon": ft.Icons.COOKIE_OUTLINED, "ratio": 0.05},
     }
 
     # Banner de notificaciones flotante
-    status_text = ft.Text("", color="white", size=13, weight="bold")
+    status_text = ft.Text("", color="white", size=13, weight=ft.FontWeight.W_600)
     status_banner = ft.Container(
         content=ft.Row([status_text], alignment=ft.MainAxisAlignment.CENTER),
-        bgcolor="#10b981",
+        bgcolor="#3F7D58",
         padding=12,
         visible=False,
     )
 
-    def notify(msg, color="#1d8cf8"):
+    def notify(msg, color="#24543F"):
         status_text.value = msg
         status_banner.bgcolor = color
         status_banner.visible = True
@@ -498,17 +531,21 @@ def main(page: ft.Page):
 
         threading.Thread(target=hide_later, daemon=True).start()
 
-    def make_button(text, bg_color, on_click_fn, text_color="white", expand=False):
+    def make_button(text, bg_color, on_click_fn, text_color="white", expand=False, icon=None):
+        ic, label, trailing = split_btn_icon(text)
+        ic = icon or ic
+        parts = [ft.Text(label, color=text_color, weight=ft.FontWeight.W_600, size=14)]
+        if ic:
+            icon_ctl = ft.Icon(ic, size=18, color=text_color)
+            parts = parts + [icon_ctl] if trailing else [icon_ctl] + parts
         return ft.Container(
             bgcolor=bg_color,
-            border_radius=16,
-            padding=15,
+            border_radius=10,
+            padding=ft.Padding(left=16, right=16, top=14, bottom=14),
             expand=expand,
             on_click=on_click_fn,
-            content=ft.Row(
-                [ft.Text(text, color=text_color, weight="bold", size=15)],
-                alignment=ft.MainAxisAlignment.CENTER,
-            ),
+            ink=True,
+            content=ft.Row(parts, alignment=ft.MainAxisAlignment.CENTER, spacing=8),
         )
 
     # Contenedor raíz que alterna entre: Selector de Usuarios / Onboarding / App Principal
@@ -531,41 +568,32 @@ def main(page: ft.Page):
             cards_col.controls.append(
                 ft.Container(
                     bgcolor="#ffffff",
-                    border_radius=20,
+                    border_radius=12,
                     padding=16,
-                    shadow=CARD_SHADOW,
+                    shadow=CARD_SHADOW, border=CARD_BORDER,
                     on_click=lambda e, i=uid: login_as_user(i),
                     content=ft.Row(
                         [
-                            ft.Container(
-                                width=56,
-                                height=56,
-                                border_radius=28,
-                                bgcolor="#eff6ff",
-                                content=ft.Row(
-                                    [ft.Text(uavatar, size=28)],
-                                    alignment=ft.MainAxisAlignment.CENTER,
-                                ),
-                            ),
+                            avatar_chip(uname, 52),
                             ft.Container(width=6),
                             ft.Column(
                                 [
                                     ft.Text(
                                         uname,
                                         size=18,
-                                        weight="bold",
-                                        color="#1e293b",
+                                        weight=ft.FontWeight.W_600,
+                                        color="#1C1B18",
                                     ),
                                     ft.Text(
                                         f"{ugoal} • {int(ukcal)} kcal/día",
                                         size=13,
-                                        color="#1d8cf8",
-                                        weight="bold",
+                                        color="#24543F",
+                                        weight=ft.FontWeight.W_600,
                                     ),
                                     ft.Text(
                                         f"{uage} años • {int(uw)} kg • {int(uh)} cm",
                                         size=12,
-                                        color="#64748b",
+                                        color="#77736A",
                                     ),
                                 ],
                                 spacing=2,
@@ -574,7 +602,7 @@ def main(page: ft.Page):
                             ft.Container(
                                 padding=8,
                                 on_click=lambda e, i=uid: delete_user_profile(i),
-                                content=ft.Text("🗑️", size=18),
+                                content=ft.Icon(ft.Icons.DELETE_OUTLINE, size=20, color="#A9A59B"),
                             ),
                         ],
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -588,23 +616,23 @@ def main(page: ft.Page):
             content=ft.Column(
                 [
                     ft.Container(height=20),
-                    ft.Text("👋 ¡Hola!", size=16, color="#1d8cf8", weight="bold"),
+                    ft.Text("PERFILES", size=11, color="#77736A", weight=ft.FontWeight.W_600),
                     ft.Text(
                         "¿Quién entrena hoy?",
                         size=28,
-                        weight="bold",
-                        color="#1e293b",
+                        weight=ft.FontWeight.W_600,
+                        color="#1C1B18",
                     ),
                     ft.Text(
-                        "Selecciona tu perfil o crea uno nuevo para calcular tus calorías.",
+                        "Elige un perfil o crea uno nuevo.",
                         size=13,
-                        color="#64748b",
+                        color="#77736A",
                     ),
                     ft.Container(height=8),
                     cards_col,
                     make_button(
-                        "➕ Crear Nuevo Usuario",
-                        "#1d8cf8",
+                        "Crear perfil",
+                        "#24543F",
                         lambda e: show_onboarding_wizard(is_first_user=False),
                     ),
                     ft.Container(height=12),
@@ -617,7 +645,7 @@ def main(page: ft.Page):
 
     def delete_user_profile(uid):
         db.delete_user(uid)
-        notify("Perfil eliminado", "#ef4444")
+        notify("Perfil eliminado", "#B8453A")
         show_user_selector()
 
     def login_as_user(uid):
@@ -647,16 +675,16 @@ def main(page: ft.Page):
 
         wiz_body = ft.Container(expand=True)
         progress_bar = ft.ProgressBar(
-            value=0.25, color="#1d8cf8", bgcolor="#e2e8f0", height=8
+            value=0.25, color="#24543F", bgcolor="#E4DFD3", height=8
         )
-        step_title_lbl = ft.Text("Paso 1 de 4", size=13, color="#1d8cf8", weight="bold")
+        step_title_lbl = ft.Text("Paso 1 de 4", size=13, color="#24543F", weight=ft.FontWeight.W_600)
 
         tf_wiz_name = ft.TextField(
             label="Tu nombre o apodo",
             value=wiz_state["name"],
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#cbd5e1",
+            border_radius=10,
+            border_color="#D6D0C2",
             on_change=lambda e: wiz_state.update({"name": e.control.value}),
         )
 
@@ -673,28 +701,28 @@ def main(page: ft.Page):
             )
             return ft.Container(
                 bgcolor="#ffffff",
-                border_radius=20,
+                border_radius=12,
                 padding=16,
-                shadow=CARD_SHADOW,
+                shadow=CARD_SHADOW, border=CARD_BORDER,
                 content=ft.Column(
                     [
-                        ft.Text(title, size=13, color="#64748b", weight="bold"),
+                        ft.Text(title, size=13, color="#77736A", weight=ft.FontWeight.W_600),
                         ft.Row(
                             [
                                 ft.Container(
-                                    bgcolor="#f1f5f9",
-                                    border_radius=12,
+                                    bgcolor="#F4F1EA",
+                                    border_radius=8,
                                     padding=10,
                                     on_click=lambda e: change_metric(
                                         key, -5, min_v, max_v
                                     ),
                                     content=ft.Text(
-                                        "-5", weight="bold", color="#475569"
+                                        "-5", weight=ft.FontWeight.W_600, color="#5A574F"
                                     ),
                                 ),
                                 ft.Container(
-                                    bgcolor="#eff6ff",
-                                    border_radius=12,
+                                    bgcolor="#E3ECE6",
+                                    border_radius=8,
                                     padding=12,
                                     on_click=lambda e: change_metric(
                                         key, -1, min_v, max_v
@@ -702,8 +730,8 @@ def main(page: ft.Page):
                                     content=ft.Text(
                                         "−",
                                         size=18,
-                                        weight="bold",
-                                        color="#1d8cf8",
+                                        weight=ft.FontWeight.W_600,
+                                        color="#24543F",
                                     ),
                                 ),
                                 ft.Column(
@@ -711,18 +739,18 @@ def main(page: ft.Page):
                                         ft.Text(
                                             val_str,
                                             size=28,
-                                            weight="bold",
-                                            color="#1e293b",
+                                            weight=ft.FontWeight.W_600,
+                                            color="#1C1B18",
                                         ),
-                                        ft.Text(unit, size=12, color="#64748b"),
+                                        ft.Text(unit, size=12, color="#77736A"),
                                     ],
                                     horizontal_alignment=ft.CrossAxisAlignment.CENTER,
                                     spacing=0,
                                     expand=True,
                                 ),
                                 ft.Container(
-                                    bgcolor="#eff6ff",
-                                    border_radius=12,
+                                    bgcolor="#E3ECE6",
+                                    border_radius=8,
                                     padding=12,
                                     on_click=lambda e: change_metric(
                                         key, 1, min_v, max_v
@@ -730,19 +758,19 @@ def main(page: ft.Page):
                                     content=ft.Text(
                                         "+",
                                         size=18,
-                                        weight="bold",
-                                        color="#1d8cf8",
+                                        weight=ft.FontWeight.W_600,
+                                        color="#24543F",
                                     ),
                                 ),
                                 ft.Container(
-                                    bgcolor="#f1f5f9",
-                                    border_radius=12,
+                                    bgcolor="#F4F1EA",
+                                    border_radius=8,
                                     padding=10,
                                     on_click=lambda e: change_metric(
                                         key, 5, min_v, max_v
                                     ),
                                     content=ft.Text(
-                                        "+5", weight="bold", color="#475569"
+                                        "+5", weight=ft.FontWeight.W_600, color="#5A574F"
                                     ),
                                 ),
                             ],
@@ -769,8 +797,8 @@ def main(page: ft.Page):
                         ft.Container(
                             width=50,
                             height=50,
-                            border_radius=25,
-                            bgcolor="#1d8cf8" if active else "#ffffff",
+                            border_radius=12,
+                            bgcolor="#24543F" if active else "#ffffff",
                             on_click=lambda e, a=av: (
                                 wiz_state.update({"avatar": a}),
                                 render_wizard_step(),
@@ -783,27 +811,27 @@ def main(page: ft.Page):
                     )
 
                 gender_cards = ft.Row(spacing=12)
-                for g_name, g_icon in [("Hombre", "👨"), ("Mujer", "👩")]:
+                for g_name, g_icon in [("Hombre", ft.Icons.MALE), ("Mujer", ft.Icons.FEMALE)]:
                     active = wiz_state["gender"] == g_name
                     gender_cards.controls.append(
                         ft.Container(
                             expand=True,
                             padding=20,
-                            border_radius=20,
-                            bgcolor="#1d8cf8" if active else "#ffffff",
-                            shadow=CARD_SHADOW,
+                            border_radius=12,
+                            bgcolor="#24543F" if active else "#ffffff",
+                            shadow=CARD_SHADOW, border=CARD_BORDER,
                             on_click=lambda e, gn=g_name: (
                                 wiz_state.update({"gender": gn}),
                                 render_wizard_step(),
                             ),
                             content=ft.Column(
                                 [
-                                    ft.Text(g_icon, size=36),
+                                    ft.Icon(g_icon, size=30, color="white" if active else "#1C1B18"),
                                     ft.Text(
                                         g_name,
                                         size=16,
-                                        weight="bold",
-                                        color="white" if active else "#1e293b",
+                                        weight=ft.FontWeight.W_600,
+                                        color="white" if active else "#1C1B18",
                                     ),
                                 ],
                                 horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -815,30 +843,23 @@ def main(page: ft.Page):
                 wiz_body.content = ft.Column(
                     [
                         ft.Text(
-                            "¡Vamos a crear tu perfil!",
+                            "Tu perfil",
                             size=26,
-                            weight="bold",
-                            color="#1e293b",
+                            weight=ft.FontWeight.W_600,
+                            color="#1C1B18",
                         ),
                         ft.Text(
-                            "Personaliza tu cuenta para adaptar el cálculo metabólico.",
+                            "Con estos datos calculamos tus calorías y macros.",
                             size=13,
-                            color="#64748b",
+                            color="#77736A",
                         ),
                         ft.Container(height=6),
                         tf_wiz_name,
                         ft.Text(
-                            "Elige tu icono:",
-                            size=13,
-                            weight="bold",
-                            color="#64748b",
-                        ),
-                        avatar_row,
-                        ft.Text(
                             "Selecciona tu sexo biológico:",
                             size=13,
-                            weight="bold",
-                            color="#64748b",
+                            weight=ft.FontWeight.W_600,
+                            color="#77736A",
                         ),
                         gender_cards,
                     ],
@@ -853,13 +874,13 @@ def main(page: ft.Page):
                         ft.Text(
                             "Tus medidas corporales",
                             size=26,
-                            weight="bold",
-                            color="#1e293b",
+                            weight=ft.FontWeight.W_600,
+                            color="#1C1B18",
                         ),
                         ft.Text(
-                            "Ajusta rápidamente tu edad, peso y altura con los botones.",
+                            "Ajusta tus medidas.",
                             size=13,
-                            color="#64748b",
+                            color="#77736A",
                         ),
                         create_stepper_card(
                             "EDAD", "años", "age", 12, 95, is_int=True
@@ -882,34 +903,34 @@ def main(page: ft.Page):
                     active = wiz_state["activity"] == act_name
                     act_col.controls.append(
                         ft.Container(
-                            bgcolor="#1d8cf8" if active else "#ffffff",
+                            bgcolor="#24543F" if active else "#ffffff",
                             padding=16,
-                            border_radius=18,
-                            shadow=CARD_SHADOW,
+                            border_radius=12,
+                            shadow=CARD_SHADOW, border=CARD_BORDER,
                             on_click=lambda e, an=act_name: (
                                 wiz_state.update({"activity": an}),
                                 render_wizard_step(),
                             ),
                             content=ft.Row(
                                 [
-                                    ft.Text(meta["icon"], size=28),
+                                    ft.Icon(meta["icon"], size=24, color="white" if active else "#24543F"),
                                     ft.Container(width=8),
                                     ft.Column(
                                         [
                                             ft.Text(
                                                 act_name,
                                                 size=16,
-                                                weight="bold",
+                                                weight=ft.FontWeight.W_600,
                                                 color="white"
                                                 if active
-                                                else "#1e293b",
+                                                else "#1C1B18",
                                             ),
                                             ft.Text(
                                                 meta["desc"],
                                                 size=12,
-                                                color="#e0f2fe"
+                                                color="#CFE0D5"
                                                 if active
-                                                else "#64748b",
+                                                else "#77736A",
                                             ),
                                         ],
                                         spacing=2,
@@ -925,13 +946,13 @@ def main(page: ft.Page):
                         ft.Text(
                             "Nivel de actividad",
                             size=26,
-                            weight="bold",
-                            color="#1e293b",
+                            weight=ft.FontWeight.W_600,
+                            color="#1C1B18",
                         ),
                         ft.Text(
                             "¿Cuánto te mueves durante la semana?",
                             size=13,
-                            color="#64748b",
+                            color="#77736A",
                         ),
                         act_col,
                     ],
@@ -955,34 +976,34 @@ def main(page: ft.Page):
                     active = wiz_state["goal"] == g_name
                     goals_col.controls.append(
                         ft.Container(
-                            bgcolor="#1d8cf8" if active else "#ffffff",
+                            bgcolor="#24543F" if active else "#ffffff",
                             padding=14,
-                            border_radius=18,
-                            shadow=CARD_SHADOW,
+                            border_radius=12,
+                            shadow=CARD_SHADOW, border=CARD_BORDER,
                             on_click=lambda e, gn=g_name: (
                                 wiz_state.update({"goal": gn}),
                                 render_wizard_step(),
                             ),
                             content=ft.Row(
                                 [
-                                    ft.Text(meta["icon"], size=26),
+                                    ft.Icon(meta["icon"], size=24, color="white" if active else "#24543F"),
                                     ft.Container(width=8),
                                     ft.Column(
                                         [
                                             ft.Text(
                                                 g_name,
                                                 size=16,
-                                                weight="bold",
+                                                weight=ft.FontWeight.W_600,
                                                 color="white"
                                                 if active
-                                                else "#1e293b",
+                                                else "#1C1B18",
                                             ),
                                             ft.Text(
                                                 meta["desc"],
                                                 size=12,
-                                                color="#e0f2fe"
+                                                color="#CFE0D5"
                                                 if active
-                                                else "#64748b",
+                                                else "#77736A",
                                             ),
                                         ],
                                         spacing=2,
@@ -994,24 +1015,24 @@ def main(page: ft.Page):
                     )
 
                 summary_card = ft.Container(
-                    bgcolor="#1e293b",
+                    bgcolor="#1C1B18",
                     padding=20,
-                    border_radius=22,
+                    border_radius=14,
                     content=ft.Column(
                         [
                             ft.Text(
-                                "🎯 TU PLAN NUTRICIONAL DIARIO",
+                                "OBJETIVO DIARIO",
                                 size=12,
-                                color="#38bdf8",
-                                weight="bold",
+                                color="#E3B965",
+                                weight=ft.FontWeight.W_600,
                             ),
                             ft.Text(
                                 f"{int(tkcal):,} kcal".replace(",", "."),
                                 size=34,
-                                weight="bold",
+                                weight=ft.FontWeight.W_600,
                                 color="white",
                             ),
-                            ft.Divider(color="#334155"),
+                            ft.Divider(color="#3A3832"),
                             ft.Row(
                                 [
                                     ft.Column(
@@ -1019,13 +1040,13 @@ def main(page: ft.Page):
                                             ft.Text(
                                                 f"{int(tc)}g",
                                                 size=18,
-                                                weight="bold",
-                                                color="#38bdf8",
+                                                weight=ft.FontWeight.W_600,
+                                                color="#E3B965",
                                             ),
                                             ft.Text(
                                                 "Carbos",
                                                 size=12,
-                                                color="#94a3b8",
+                                                color="#A9A59B",
                                             ),
                                         ],
                                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1035,13 +1056,13 @@ def main(page: ft.Page):
                                             ft.Text(
                                                 f"{int(tp)}g",
                                                 size=18,
-                                                weight="bold",
-                                                color="#10b981",
+                                                weight=ft.FontWeight.W_600,
+                                                color="#3F7D58",
                                             ),
                                             ft.Text(
                                                 "Proteína",
                                                 size=12,
-                                                color="#94a3b8",
+                                                color="#A9A59B",
                                             ),
                                         ],
                                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1051,13 +1072,13 @@ def main(page: ft.Page):
                                             ft.Text(
                                                 f"{int(tf)}g",
                                                 size=18,
-                                                weight="bold",
-                                                color="#f59e0b",
+                                                weight=ft.FontWeight.W_600,
+                                                color="#C9763F",
                                             ),
                                             ft.Text(
                                                 "Grasas",
                                                 size=12,
-                                                color="#94a3b8",
+                                                color="#A9A59B",
                                             ),
                                         ],
                                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1076,8 +1097,8 @@ def main(page: ft.Page):
                         ft.Text(
                             "¿Cuál es tu objetivo?",
                             size=26,
-                            weight="bold",
-                            color="#1e293b",
+                            weight=ft.FontWeight.W_600,
+                            color="#1C1B18",
                         ),
                         goals_col,
                         summary_card,
@@ -1092,19 +1113,19 @@ def main(page: ft.Page):
                 nav_row_controls.append(
                     make_button(
                         "⬅ Atrás",
-                        "#e2e8f0",
+                        "#E4DFD3",
                         lambda e: prev_step(),
-                        text_color="#334155",
+                        text_color="#3A3832",
                         expand=True,
                     )
                 )
             elif not is_first_user:
                 nav_row_controls.append(
                     make_button(
-                        "✖ Cancelar",
-                        "#e2e8f0",
+                        "Cancelar",
+                        "#E4DFD3",
                         lambda e: show_user_selector(),
-                        text_color="#334155",
+                        text_color="#3A3832",
                         expand=True,
                     )
                 )
@@ -1113,7 +1134,7 @@ def main(page: ft.Page):
                 nav_row_controls.append(
                     make_button(
                         "Siguiente ➡",
-                        "#1d8cf8",
+                        "#24543F",
                         lambda e: next_step(),
                         expand=True,
                     )
@@ -1121,8 +1142,8 @@ def main(page: ft.Page):
             else:
                 nav_row_controls.append(
                     make_button(
-                        "🚀 ¡Empezar Ahora!",
-                        "#10b981",
+                        "Empezar",
+                        "#3F7D58",
                         lambda e: finish_wizard(),
                         expand=True,
                     )
@@ -1135,7 +1156,7 @@ def main(page: ft.Page):
             if step[0] == 0:
                 name_clean = (tf_wiz_name.value or "").strip()
                 if not name_clean:
-                    notify("Escribe tu nombre para continuar", "#ef4444")
+                    notify("Escribe tu nombre para continuar", "#B8453A")
                     return
                 wiz_state["name"] = name_clean
             step[0] += 1
@@ -1173,7 +1194,7 @@ def main(page: ft.Page):
                     tf,
                 )
                 uid = wiz_state["id"]
-                notify("Perfil actualizado con éxito", "#10b981")
+                notify("Perfil actualizado con éxito", "#3F7D58")
             else:
                 uid = db.create_user(
                     name_clean,
@@ -1190,7 +1211,7 @@ def main(page: ft.Page):
                     tc,
                     tf,
                 )
-                notify(f"¡Bienvenido/a {name_clean}!", "#10b981")
+                notify(f"¡Bienvenido/a {name_clean}!", "#3F7D58")
 
             login_as_user(uid)
 
@@ -1227,31 +1248,29 @@ def main(page: ft.Page):
             return
 
         # Cabecera Superior con Selector Rápido de Usuario
-        header_user_txt = ft.Text("", size=14, weight="bold", color="#1e293b")
-        header_avatar_txt = ft.Text("", size=18)
+        header_user_txt = ft.Text("", size=14, weight=ft.FontWeight.W_600, color="#1C1B18")
+        header_avatar_txt = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#24543F")
 
         top_bar = ft.Container(
             bgcolor="#ffffff",
             padding=ft.Padding(left=16, right=16, top=18, bottom=10),
+            border=ft.Border(bottom=ft.BorderSide(1, "#E4DFD3")),
             content=ft.Row(
                 [
-                    ft.Row(
-                        [
-                            ft.Text("GymMacro", size=20, weight="bold", color="#1e293b"),
-                            ft.Text("PRO", size=20, weight="bold", color="#1d8cf8"),
-                        ],
-                        spacing=4,
-                    ),
+                    ft.Text("GymMacro", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     ft.Container(
-                        bgcolor="#f1f5f9",
-                        border_radius=20,
+                        bgcolor="#F4F1EA",
+                        border_radius=12,
                         padding=ft.Padding(left=12, right=12, top=6, bottom=6),
                         on_click=show_user_selector,
                         content=ft.Row(
                             [
-                                header_avatar_txt,
+                                ft.Container(
+                                    width=26, height=26, border_radius=8, bgcolor="#E3ECE6",
+                                    alignment=ft.Alignment.CENTER, content=header_avatar_txt,
+                                ),
                                 header_user_txt,
-                                ft.Text("🔄", size=12),
+                                ft.Icon(ft.Icons.UNFOLD_MORE, size=16, color="#77736A"),
                             ],
                             spacing=6,
                         ),
@@ -1262,27 +1281,27 @@ def main(page: ft.Page):
         )
 
         # ----- CAPA 1: PANTALLA "HOY" -----
-        lbl_consumed = ft.Text("0", size=20, weight="bold", color="#1e293b")
-        lbl_remaining = ft.Text("0", size=28, weight="bold", color="#1e293b")
-        lbl_burned = ft.Text("244", size=20, weight="bold", color="#1e293b")
+        lbl_consumed = ft.Text("0", size=20, weight=ft.FontWeight.W_600, color="#1C1B18")
+        lbl_remaining = ft.Text("0", size=28, weight=ft.FontWeight.W_600, color="#1C1B18")
+        lbl_burned = ft.Text("244", size=20, weight=ft.FontWeight.W_600, color="#1C1B18")
 
         ring_main = ft.ProgressRing(
             value=0.0,
             width=135,
             height=135,
             stroke_width=10,
-            color="#5cd6c0",
-            bgcolor="#edf1f5",
+            color="#24543F",
+            bgcolor="#ECE8DE",
         )
 
         def create_macro_col(label_title, bar_color):
             bar = ft.ProgressBar(
-                value=0.0, color=bar_color, bgcolor="#edf1f5", height=7
+                value=0.0, color=bar_color, bgcolor="#ECE8DE", height=7
             )
-            val_txt = ft.Text("0 / 0 g", size=13, weight="bold", color="#1e293b")
+            val_txt = ft.Text("0 / 0 g", size=13, weight=ft.FontWeight.W_600, color="#1C1B18")
             col = ft.Column(
                 [
-                    ft.Text(label_title, size=12, color="#64748b"),
+                    ft.Text(label_title, size=12, color="#77736A"),
                     ft.Container(content=bar, width=85, border_radius=4, padding=6),
                     val_txt,
                 ],
@@ -1292,9 +1311,9 @@ def main(page: ft.Page):
             )
             return col, bar, val_txt
 
-        col_c, bar_c, lbl_c = create_macro_col("Carbohidratos", "#38abfd")
-        col_p, bar_p, lbl_p = create_macro_col("Proteínas", "#10b981")
-        col_f, bar_f, lbl_f = create_macro_col("Grasas", "#f59e0b")
+        col_c, bar_c, lbl_c = create_macro_col("Carbohidratos", "#D9A441")
+        col_p, bar_p, lbl_p = create_macro_col("Proteínas", "#3F7D58")
+        col_f, bar_f, lbl_f = create_macro_col("Grasas", "#C9763F")
 
         meals_card_col = ft.Column(spacing=0)
 
@@ -1310,7 +1329,7 @@ def main(page: ft.Page):
         def delete_food_item(fid):
             db.delete_food(fid)
             refresh_dashboard()
-            notify("Alimento eliminado", "#ef4444")
+            notify("Alimento eliminado", "#B8453A")
 
         def refresh_dashboard():
             u = db.get_user(current_user_id[0])
@@ -1318,7 +1337,7 @@ def main(page: ft.Page):
                 return
             _, uname, uavatar, _, _, _, _, _, _, _, tkcal, tp, tc, tf, burned = u
             header_user_txt.value = uname
-            header_avatar_txt.value = uavatar
+            header_avatar_txt.value = (uname[:1] or "?").upper()
 
             foods = db.get_today_foods(current_user_id[0])
 
@@ -1363,14 +1382,14 @@ def main(page: ft.Page):
                             width=50,
                             height=50,
                             stroke_width=4,
-                            color="#38abfd",
-                            bgcolor="#edf1f5",
+                            color="#D9A441",
+                            bgcolor="#ECE8DE",
                         ),
                         ft.Container(
                             width=50,
                             height=50,
                             content=ft.Row(
-                                [ft.Text(meta["icon"], size=20)],
+                                [ft.Icon(meta["icon"], size=20, color="#1C1B18")],
                                 alignment=ft.MainAxisAlignment.CENTER,
                             ),
                         ),
@@ -1389,13 +1408,13 @@ def main(page: ft.Page):
                                     ft.Text(
                                         m_name,
                                         size=16,
-                                        weight="bold",
-                                        color="#1e293b",
+                                        weight=ft.FontWeight.W_600,
+                                        color="#1C1B18",
                                     ),
                                     ft.Text(
                                         f"{int(m_kcal)} / {int(m_target)} kcal",
                                         size=13,
-                                        color="#64748b",
+                                        color="#77736A",
                                     ),
                                 ],
                                 spacing=2,
@@ -1404,17 +1423,12 @@ def main(page: ft.Page):
                             ft.Container(
                                 width=36,
                                 height=36,
-                                border_radius=18,
-                                bgcolor="#1d8cf8",
+                                border_radius=100,
+                                bgcolor="#24543F",
                                 on_click=lambda e, mn=m_name: go_to_add_for_meal(mn),
                                 content=ft.Row(
                                     [
-                                        ft.Text(
-                                            "+",
-                                            size=20,
-                                            weight="bold",
-                                            color="white",
-                                        )
+                                        ft.Icon(ft.Icons.ADD, size=20, color="white")
                                     ],
                                     alignment=ft.MainAxisAlignment.CENTER,
                                 ),
@@ -1429,12 +1443,12 @@ def main(page: ft.Page):
                     if not m_foods:
                         meals_card_col.controls.append(
                             ft.Container(
-                                bgcolor="#f8fafc",
+                                bgcolor="#FAF8F4",
                                 padding=12,
                                 content=ft.Text(
                                     "Sin alimentos registrados. Pulsa '+' para añadir.",
                                     size=12,
-                                    color="#94a3b8",
+                                    color="#A9A59B",
                                 ),
                             )
                         )
@@ -1442,7 +1456,7 @@ def main(page: ft.Page):
                         for fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg in m_foods:
                             meals_card_col.controls.append(
                                 ft.Container(
-                                    bgcolor="#f8fafc",
+                                    bgcolor="#FAF8F4",
                                     padding=10,
                                     content=ft.Row(
                                         [
@@ -1452,13 +1466,13 @@ def main(page: ft.Page):
                                                     ft.Text(
                                                         f"• {fname} ({int(fgrams)}g)",
                                                         size=13,
-                                                        weight="bold",
-                                                        color="#334155",
+                                                        weight=ft.FontWeight.W_600,
+                                                        color="#3A3832",
                                                     ),
                                                     ft.Text(
                                                         f"{int(fkcal)} kcal | C: {fc_val:.1f}g • P: {fp:.1f}g • G: {ff:.1f}g",
                                                         size=11,
-                                                        color="#64748b",
+                                                        color="#77736A",
                                                     ),
                                                 ],
                                                 spacing=1,
@@ -1469,12 +1483,7 @@ def main(page: ft.Page):
                                                 on_click=lambda e, i=fid: delete_food_item(
                                                     i
                                                 ),
-                                                content=ft.Text(
-                                                    "✕",
-                                                    color="#ef4444",
-                                                    weight="bold",
-                                                    size=14,
-                                                ),
+                                                content=ft.Icon(ft.Icons.CLOSE, size=18, color="#B8453A"),
                                             ),
                                         ]
                                     ),
@@ -1482,11 +1491,11 @@ def main(page: ft.Page):
                             )
                         meals_card_col.controls.append(
                             ft.Container(
-                                bgcolor="#f8fafc",
+                                bgcolor="#FAF8F4",
                                 padding=ft.Padding(left=10, right=10, top=0, bottom=10),
                                 content=make_button(
                                     "⭐ Guardar como comida fija",
-                                    "#f59e0b",
+                                    "#C9763F",
                                     lambda e, mn=m_name, mf=m_foods: save_fixed_dialog(
                                         [
                                             {
@@ -1504,7 +1513,7 @@ def main(page: ft.Page):
 
                 if idx < len(meal_names) - 1:
                     meals_card_col.controls.append(
-                        ft.Divider(height=1, color="#f1f5f9")
+                        ft.Divider(height=1, color="#F4F1EA")
                     )
 
             page.update()
@@ -1520,7 +1529,7 @@ def main(page: ft.Page):
                     content=ft.Column(
                         [
                             lbl_remaining,
-                            ft.Text("Restantes", size=12, color="#64748b"),
+                            ft.Text("Restantes", size=12, color="#77736A"),
                         ],
                         alignment=ft.MainAxisAlignment.CENTER,
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1534,7 +1543,7 @@ def main(page: ft.Page):
             await go_suggestions(e)
 
         suggest_btn = make_button(
-            "💡 ¿Qué como para llegar a mis calorías?", "#8b5cf6", _go_sugg
+            "💡 ¿Qué como para llegar a mis calorías?", "#1C1B18", _go_sugg
         )
 
         view_home = ft.Container(
@@ -1544,9 +1553,9 @@ def main(page: ft.Page):
                 [
                     ft.Container(
                         bgcolor="#ffffff",
-                        border_radius=24,
+                        border_radius=14,
                         padding=20,
-                        shadow=CARD_SHADOW,
+                        shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Column(
                             [
                                 ft.Row(
@@ -1557,7 +1566,7 @@ def main(page: ft.Page):
                                                 ft.Text(
                                                     "Consumidas",
                                                     size=12,
-                                                    color="#64748b",
+                                                    color="#77736A",
                                                 ),
                                             ],
                                             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1571,7 +1580,7 @@ def main(page: ft.Page):
                                                 ft.Text(
                                                     "Quemadas",
                                                     size=12,
-                                                    color="#64748b",
+                                                    color="#77736A",
                                                 ),
                                             ],
                                             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1594,9 +1603,9 @@ def main(page: ft.Page):
                     suggest_btn,
                     ft.Container(
                         bgcolor="#ffffff",
-                        border_radius=24,
+                        border_radius=14,
                         padding=8,
-                        shadow=CARD_SHADOW,
+                        shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=meals_card_col,
                     ),
                 ],
@@ -1615,19 +1624,19 @@ def main(page: ft.Page):
                 active = selected_meal_for_add[0] == m_name
                 meal_selector_row.controls.append(
                     ft.Container(
-                        bgcolor="#1d8cf8" if active else "#ffffff",
+                        bgcolor="#24543F" if active else "#ffffff",
                         padding=10,
-                        border_radius=16,
+                        border_radius=10,
                         on_click=lambda e, mn=m_name: (
                             selected_meal_for_add.__setitem__(0, mn),
                             render_meal_selector_pills(),
                             page.update(),
                         ),
                         content=ft.Text(
-                            f"{meta['icon']} {m_name}",
+                            m_name,
                             size=12,
-                            weight="bold",
-                            color="white" if active else "#64748b",
+                            weight=ft.FontWeight.W_600,
+                            color="white" if active else "#77736A",
                         ),
                     )
                 )
@@ -1643,19 +1652,19 @@ def main(page: ft.Page):
                 active = selected_meal_for_add[0] == m_name
                 ai_meal_row.controls.append(
                     ft.Container(
-                        bgcolor="#1d8cf8" if active else "#ffffff",
+                        bgcolor="#24543F" if active else "#ffffff",
                         padding=10,
-                        border_radius=16,
+                        border_radius=10,
                         on_click=lambda e, mn=m_name: (
                             selected_meal_for_add.__setitem__(0, mn),
                             render_meal_selector_pills(),
                             page.update(),
                         ),
                         content=ft.Text(
-                            f"{meta['icon']} {m_name}",
+                            m_name,
                             size=12,
-                            weight="bold",
-                            color="white" if active else "#64748b",
+                            weight=ft.FontWeight.W_600,
+                            color="white" if active else "#77736A",
                         ),
                     )
                 )
@@ -1665,8 +1674,8 @@ def main(page: ft.Page):
         tf_search = ft.TextField(
             label="Buscar (ej. Pollo, Arroz, Avena, Huevo)",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
             expand=True,
         )
         search_results = ft.Column(spacing=6)
@@ -1674,42 +1683,42 @@ def main(page: ft.Page):
         tf_name = ft.TextField(
             label="Nombre del alimento",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
         )
         tf_grams = ft.TextField(
             label="Cantidad consumida (gramos)",
             value="100",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
         )
         tf_kcal = ft.TextField(
             label="Kcal / 100g",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
             expand=True,
         )
         tf_p = ft.TextField(
             label="Proteína / 100g",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
             expand=True,
         )
         tf_c = ft.TextField(
             label="Carbos / 100g",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
             expand=True,
         )
         tf_f = ft.TextField(
             label="Grasas / 100g",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
             expand=True,
         )
 
@@ -1721,8 +1730,8 @@ def main(page: ft.Page):
             if url:
                 food_preview.controls = [
                     ft.Container(
-                        border_radius=18,
-                        shadow=CARD_SHADOW,
+                        border_radius=12,
+                        shadow=CARD_SHADOW, border=CARD_BORDER,
                         clip_behavior=ft.ClipBehavior.HARD_EDGE,
                         content=food_thumb(url, 160),
                     )
@@ -1775,7 +1784,7 @@ def main(page: ft.Page):
                 return
             search_results.controls.clear()
             search_results.controls.append(
-                ft.Text("Buscando...", color="#1d8cf8", size=13)
+                ft.Text("Buscando...", color="#24543F", size=13)
             )
             page.update()
             search_results.controls.clear()
@@ -1787,8 +1796,8 @@ def main(page: ft.Page):
                             ft.Container(
                                 bgcolor="#ffffff",
                                 padding=12,
-                                border_radius=14,
-                                shadow=CARD_SHADOW,
+                                border_radius=10,
+                                shadow=CARD_SHADOW, border=CARD_BORDER,
                                 on_click=lambda e, n=item["name"], k=item["kcal"], p=item["p"], c=item["c"], f=item["f"]: fill_food_form(
                                     n, k, p, c, f
                                 ),
@@ -1797,20 +1806,20 @@ def main(page: ft.Page):
                                         ft.Column(
                                             [
                                                 ft.Text(
-                                                    f"⭐ {item['name']}",
-                                                    weight="bold",
+                                                    item['name'],
+                                                    weight=ft.FontWeight.W_600,
                                                     size=14,
-                                                    color="#1e293b",
+                                                    color="#1C1B18",
                                                 ),
                                                 ft.Text(
                                                     f"100g: {item['kcal']} kcal | C: {item['c']}g | P: {item['p']}g | G: {item['f']}g",
                                                     size=11,
-                                                    color="#64748b",
+                                                    color="#77736A",
                                                 ),
                                             ],
                                             expand=True,
                                         ),
-                                        ft.Text("Elegir", color="#1d8cf8", weight="bold"),
+                                        ft.Text("Elegir", color="#24543F", weight=ft.FontWeight.W_600),
                                     ]
                                 ),
                             )
@@ -1831,7 +1840,7 @@ def main(page: ft.Page):
                         ft.Container(
                             bgcolor="#ffffff",
                             padding=12,
-                            border_radius=14,
+                            border_radius=10,
                             on_click=lambda e, n=pname, k=k, p=p, c=c, f=f, im=img: fill_food_form(
                                 n, k, p, c, f, im
                             ),
@@ -1842,19 +1851,19 @@ def main(page: ft.Page):
                                         [
                                             ft.Text(
                                                 pname,
-                                                weight="bold",
+                                                weight=ft.FontWeight.W_600,
                                                 size=13,
-                                                color="#334155",
+                                                color="#3A3832",
                                             ),
                                             ft.Text(
                                                 f"100g: {int(k or 0)} kcal | C: {c or 0}g | P: {p or 0}g | G: {f or 0}g",
                                                 size=11,
-                                                color="#64748b",
+                                                color="#77736A",
                                             ),
                                         ],
                                         expand=True,
                                     ),
-                                    ft.Text("Elegir", color="#38abfd", size=12),
+                                    ft.Text("Elegir", color="#D9A441", size=12),
                                 ]
                             ),
                         )
@@ -1864,7 +1873,7 @@ def main(page: ft.Page):
 
             if not search_results.controls:
                 search_results.controls.append(
-                    ft.Text("Sin resultados.", color="#64748b")
+                    ft.Text("Sin resultados.", color="#77736A")
                 )
             page.update()
 
@@ -1885,10 +1894,10 @@ def main(page: ft.Page):
                 tf_grams.value = "100"
                 set_food_image(None)
                 expanded_meal[0] = meal_dest
-                notify(f"Añadido a {meal_dest}", "#10b981")
+                notify(f"Añadido a {meal_dest}", "#3F7D58")
                 switch_tab(0)
             except ValueError:
-                notify("Rellena los gramos y macros con números", "#ef4444")
+                notify("Rellena los gramos y macros con números", "#B8453A")
 
         # ----- COMIDAS FIJAS -----
         saved_col = ft.Column(spacing=8)
@@ -1903,7 +1912,7 @@ def main(page: ft.Page):
 
         def save_fixed_dialog(items, default_name="Mi comida", meal_type=None):
             if not items:
-                notify("No hay alimentos que guardar", "#ef4444")
+                notify("No hay alimentos que guardar", "#B8453A")
                 return
             name_field = ft.TextField(label="Nombre", value=default_name, autofocus=True)
 
@@ -1911,12 +1920,12 @@ def main(page: ft.Page):
                 nm = (name_field.value or "").strip() or default_name
                 db.save_meal(current_user_id[0], nm, meal_type or selected_meal_for_add[0], items)
                 page.pop_dialog()
-                notify(f"⭐ '{nm}' guardada en comidas fijas", "#10b981")
+                notify(f"'{nm}' guardada en comidas fijas", "#3F7D58")
 
             page.show_dialog(
                 ft.AlertDialog(
                     modal=True,
-                    title=ft.Text("⭐ Guardar como comida fija"),
+                    title=ft.Text("Guardar como comida fija"),
                     content=name_field,
                     actions=[
                         ft.TextButton("Cancelar", on_click=lambda e: page.pop_dialog()),
@@ -1930,7 +1939,7 @@ def main(page: ft.Page):
                 if s_id == sid:
                     meal_dest = selected_meal_for_add[0]
                     add_items_to_log(items, meal_dest)
-                    notify(f"Añadido a {meal_dest}", "#10b981")
+                    notify(f"Añadido a {meal_dest}", "#3F7D58")
                     switch_tab(0)
                     return
 
@@ -1945,8 +1954,8 @@ def main(page: ft.Page):
             if not meals:
                 saved_col.controls.append(
                     ft.Text(
-                        "Aún no tienes comidas fijas. Guárdalas con ⭐ desde 'Hoy' o desde la IA.",
-                        size=12, color="#94a3b8",
+                        "Aún no tienes comidas fijas. Guárdalas desde 'Hoy' o desde la IA.",
+                        size=12, color="#A9A59B",
                     )
                 )
             for sid, sname, _, items in meals:
@@ -1956,29 +1965,29 @@ def main(page: ft.Page):
                 tf_ = sum(i["f"] for i in items)
                 saved_col.controls.append(
                     ft.Container(
-                        bgcolor="#ffffff", border_radius=16, padding=12, shadow=CARD_SHADOW,
+                        bgcolor="#ffffff", border_radius=10, padding=12, shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Row(
                             [
                                 ft.Column(
                                     [
-                                        ft.Text(f"⭐ {sname}", size=14, weight="bold", color="#1e293b"),
+                                        ft.Text(sname, size=14, weight=ft.FontWeight.W_600, color="#1C1B18"),
                                         ft.Text(
                                             f"{int(tk)} kcal • P {int(tp_)}g • C {int(tc_)}g • G {int(tf_)}g",
-                                            size=11, color="#64748b",
+                                            size=11, color="#77736A",
                                         ),
-                                        ft.Text(", ".join(i["name"] for i in items), size=11, color="#94a3b8"),
+                                        ft.Text(", ".join(i["name"] for i in items), size=11, color="#A9A59B"),
                                     ],
                                     spacing=2, expand=True,
                                 ),
                                 ft.Container(
-                                    padding=10, bgcolor="#1d8cf8", border_radius=12,
+                                    padding=10, bgcolor="#24543F", border_radius=8,
                                     on_click=lambda e, s_=sid: use_saved_meal(s_),
-                                    content=ft.Text("➕", color="white", weight="bold"),
+                                    content=ft.Icon(ft.Icons.ADD, size=18, color="white"),
                                 ),
                                 ft.Container(
                                     padding=8,
                                     on_click=lambda e, s_=sid: delete_saved(s_),
-                                    content=ft.Text("🗑️", size=16),
+                                    content=ft.Icon(ft.Icons.DELETE_OUTLINE, size=20, color="#A9A59B"),
                                 ),
                             ],
                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -1991,31 +2000,31 @@ def main(page: ft.Page):
             expand=True,
             content=ft.Column(
                 [
-                    ft.Text("Añadir Alimento", size=24, weight="bold", color="#1e293b"),
+                    ft.Text("Añadir alimento", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     meal_selector_row,
                     ft.Row(
                         [
                             tf_search,
                             ft.Container(
-                                bgcolor="#1d8cf8",
+                                bgcolor="#24543F",
                                 padding=14,
-                                border_radius=14,
+                                border_radius=10,
                                 on_click=search_openfoodfacts,
-                                content=ft.Text("🔍", size=18),
+                                content=ft.Icon(ft.Icons.SEARCH, size=20, color="white"),
                             ),
                         ]
                     ),
                     search_results,
-                    ft.Divider(color="#e2e8f0"),
+                    ft.Divider(color="#E4DFD3"),
                     food_preview,
                     tf_name,
                     tf_grams,
                     ft.Row([tf_kcal, tf_p]),
                     ft.Row([tf_c, tf_f]),
-                    make_button("➕ Registrar Alimento", "#1d8cf8", save_food_entry),
-                    ft.Divider(color="#e2e8f0"),
-                    ft.Text("⭐ Mis comidas fijas", size=18, weight="bold", color="#1e293b"),
-                    ft.Text("Toca ➕ para añadirlas a la comida seleccionada arriba.", size=12, color="#64748b"),
+                    make_button("Registrar alimento", "#24543F", save_food_entry),
+                    ft.Divider(color="#E4DFD3"),
+                    ft.Text("Mis comidas fijas", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    ft.Text("Pulsa + para añadirlas a la comida seleccionada arriba.", size=12, color="#77736A"),
                     saved_col,
                 ],
                 scroll=ft.ScrollMode.AUTO,
@@ -2030,9 +2039,9 @@ def main(page: ft.Page):
             label="¿Qué has comido?",
             hint_text="Ej: 2 rebanadas de pan integral, 50 g de pollo y 2 cucharadas de queso cottage",
             multiline=True, min_lines=3, max_lines=6,
-            bgcolor="#ffffff", border_radius=14, border_color="#e2e8f0",
+            bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3",
         )
-        ai_loading_txt = ft.Text("Pensando…", size=13, color="#64748b")
+        ai_loading_txt = ft.Text("Pensando…", size=13, color="#77736A")
         ai_loading = ft.Row(
             [ft.ProgressRing(width=18, height=18, stroke_width=3), ai_loading_txt],
             visible=False,
@@ -2066,7 +2075,7 @@ def main(page: ft.Page):
             ai_state["items"] = []
             tf_ai.value = ""
             render_ai_items()
-            notify(f"{n} alimento(s) añadidos a {meal_dest}", "#10b981")
+            notify(f"{n} alimento(s) añadidos a {meal_dest}", "#3F7D58")
             switch_tab(0)
 
         def render_ai_items():
@@ -2077,20 +2086,20 @@ def main(page: ft.Page):
             for idx, it in enumerate(items):
                 ai_result_col.controls.append(
                     ft.Container(
-                        bgcolor="#ffffff", border_radius=14, padding=12, shadow=CARD_SHADOW,
+                        bgcolor="#ffffff", border_radius=10, padding=12, shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Row(
                             [
                                 ft.Column(
                                     [
-                                        ft.Text(f"{it['name']} (~{int(it['grams'])} g)", size=14, weight="bold", color="#1e293b"),
-                                        ft.Text(macro_line(it), size=11, color="#64748b"),
+                                        ft.Text(f"{it['name']} (~{int(it['grams'])} g)", size=14, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                        ft.Text(macro_line(it), size=11, color="#77736A"),
                                     ],
                                     spacing=2, expand=True,
                                 ),
                                 ft.Container(
                                     padding=6,
                                     on_click=lambda e, i=idx: remove_ai_item(i),
-                                    content=ft.Text("✕", color="#ef4444", weight="bold"),
+                                    content=ft.Icon(ft.Icons.CLOSE, size=18, color="#B8453A"),
                                 ),
                             ]
                         ),
@@ -2099,34 +2108,34 @@ def main(page: ft.Page):
             tot = {k: sum(i[k] for i in items) for k in ("kcal", "p", "c", "f")}
             ai_result_col.controls.append(
                 ft.Container(
-                    bgcolor="#1e293b", border_radius=14, padding=12,
-                    content=ft.Text(f"TOTAL: {macro_line(tot)}", size=12, weight="bold", color="white"),
+                    bgcolor="#1C1B18", border_radius=10, padding=12,
+                    content=ft.Text(f"TOTAL: {macro_line(tot)}", size=12, weight=ft.FontWeight.W_600, color="white"),
                 )
             )
             ai_result_col.controls.append(
-                make_button(f"✅ Registrar en {selected_meal_for_add[0]}", "#10b981", register_ai)
+                make_button(f"✅ Registrar en {selected_meal_for_add[0]}", "#3F7D58", register_ai)
             )
             ai_result_col.controls.append(
                 make_button(
-                    "⭐ Guardar como comida fija", "#f59e0b",
+                    "⭐ Guardar como comida fija", "#C9763F",
                     lambda e: save_fixed_dialog(list(ai_state["items"]), "Mi comida habitual"),
                 )
             )
             ai_result_col.controls.append(
-                make_button("Descartar", "#e2e8f0", discard_ai, text_color="#334155")
+                make_button("Descartar", "#E4DFD3", discard_ai, text_color="#3A3832")
             )
 
         async def analyze_text(e=None):
             text = (tf_ai.value or "").strip()
             if not text:
-                notify("Escribe o dicta lo que has comido", "#ef4444")
+                notify("Escribe o dicta lo que has comido", "#B8453A")
                 return
             set_busy(True, "Calculando pesos y macros…")
             try:
                 ai_state["items"] = await asyncio.to_thread(ai_parse_foods, text)
             except Exception as ex:
                 set_busy(False)
-                notify(f"IA: {ex}", "#ef4444")
+                notify(f"IA: {ex}", "#B8453A")
                 return
             render_ai_items()
             set_busy(False)
@@ -2148,36 +2157,36 @@ def main(page: ft.Page):
                 [{"name": o["title"], "grams": o["grams"], "kcal": o["kcal"], "p": o["p"], "c": o["c"], "f": o["f"]}],
                 meal_dest,
             )
-            notify(f"Añadido a {meal_dest}", "#10b981")
+            notify(f"Añadido a {meal_dest}", "#3F7D58")
             switch_tab(0)
 
         def render_suggestions(options, rem_kcal):
             ai_suggest_col.controls.clear()
             if not options:
                 ai_suggest_col.controls.append(
-                    ft.Text("La IA no encontró opciones que encajen sin pasarte. Inténtalo de nuevo.", size=12, color="#64748b")
+                    ft.Text("La IA no encontró opciones que encajen sin pasarte. Inténtalo de nuevo.", size=12, color="#77736A")
                 )
                 return
             ai_suggest_col.controls.append(
-                ft.Text(f"Te quedan {int(rem_kcal)} kcal. Todas estas opciones caben sin pasarte:", size=12, color="#64748b")
+                ft.Text(f"Te quedan {int(rem_kcal)} kcal. Todas estas opciones caben sin pasarte:", size=12, color="#77736A")
             )
             for o in options:
                 steps = "\n".join(f"{i + 1}. {st}" for i, st in enumerate(o["steps"]))
                 ai_suggest_col.controls.append(
                     ft.Container(
-                        bgcolor="#ffffff", border_radius=18, padding=14, shadow=CARD_SHADOW,
+                        bgcolor="#ffffff", border_radius=12, padding=14, shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Column(
                             [
-                                ft.Text(o["title"], size=15, weight="bold", color="#1e293b"),
-                                ft.Text(o["description"], size=12, color="#64748b"),
-                                ft.Text(macro_line(o), size=12, weight="bold", color="#1d8cf8"),
-                                ft.Text("🛒 " + ", ".join(o["ingredients"]), size=11, color="#334155") if o["ingredients"] else ft.Container(),
-                                ft.Text(steps, size=11, color="#475569") if steps else ft.Container(),
+                                ft.Text(o["title"], size=15, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                ft.Text(o["description"], size=12, color="#77736A"),
+                                ft.Text(macro_line(o), size=12, weight=ft.FontWeight.W_600, color="#24543F"),
+                                ft.Text("Ingredientes: " + ", ".join(o["ingredients"]), size=11, color="#3A3832") if o["ingredients"] else ft.Container(),
+                                ft.Text(steps, size=11, color="#5A574F") if steps else ft.Container(),
                                 ft.Row(
                                     [
-                                        make_button("➕ Registrar", "#10b981", lambda e, oo=o: add_suggestion(oo), expand=True),
+                                        make_button("➕ Registrar", "#3F7D58", lambda e, oo=o: add_suggestion(oo), expand=True),
                                         make_button(
-                                            "⭐ Guardar", "#f59e0b",
+                                            "⭐ Guardar", "#C9763F",
                                             lambda e, oo=o: save_fixed_dialog(
                                                 [{"name": oo["title"], "grams": oo["grams"], "kcal": oo["kcal"], "p": oo["p"], "c": oo["c"], "f": oo["f"]}],
                                                 oo["title"],
@@ -2196,7 +2205,7 @@ def main(page: ft.Page):
         async def run_suggestions(e=None):
             rem, eaten = today_remaining()
             if rem["kcal"] < 60:
-                ai_suggest_col.controls = [ft.Text("🎉 ¡Ya has llegado a tus calorías de hoy!", size=13, color="#10b981", weight="bold")]
+                ai_suggest_col.controls = [ft.Text("Ya has llegado a tus calorías de hoy.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600)]
                 page.update()
                 return
             set_busy(True, "Buscando opciones para ti…")
@@ -2204,7 +2213,7 @@ def main(page: ft.Page):
                 options = await asyncio.to_thread(ai_suggest, rem, eaten, selected_meal_for_add[0])
             except Exception as ex:
                 set_busy(False)
-                notify(f"IA: {ex}", "#ef4444")
+                notify(f"IA: {ex}", "#B8453A")
                 return
             render_suggestions(options, rem["kcal"])
             set_busy(False)
@@ -2218,19 +2227,19 @@ def main(page: ft.Page):
             expand=True,
             content=ft.Column(
                 [
-                    ft.Text("Asistente IA 🤖", size=24, weight="bold", color="#1e293b"),
-                    ft.Text("Cuéntame qué has comido y yo calculo pesos y macros.", size=13, color="#64748b"),
-                    ft.Text("Se registrará en:", size=12, weight="bold", color="#64748b"),
+                    ft.Text("Asistente", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    ft.Text("Escribe o dicta lo que has comido. Estimo pesos y macros.", size=13, color="#77736A"),
+                    ft.Text("Se registrará en:", size=12, weight=ft.FontWeight.W_600, color="#77736A"),
                     ai_meal_row,
                     tf_ai,
-                    ft.Text("🎤 Para dictar, pulsa el micrófono de tu teclado.", size=11, color="#94a3b8"),
-                    make_button("✨ Calcular macros", "#8b5cf6", analyze_text),
+                    ft.Text("Para dictar, usa el micrófono del teclado.", size=11, color="#A9A59B"),
+                    make_button("✨ Calcular macros", "#1C1B18", analyze_text),
                     ai_loading,
                     ai_result_col,
-                    ft.Divider(color="#e2e8f0"),
-                    ft.Text("💡 Completar mi día", size=18, weight="bold", color="#1e293b"),
-                    ft.Text("Si te faltan calorías, te propongo opciones y recetas sin pasarte.", size=12, color="#64748b"),
-                    make_button("Ver opciones para llegar", "#1d8cf8", run_suggestions),
+                    ft.Divider(color="#E4DFD3"),
+                    ft.Text("Completar el día", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    ft.Text("Si te faltan calorías, propone opciones y recetas sin pasarte.", size=12, color="#77736A"),
+                    make_button("Ver opciones para llegar", "#24543F", run_suggestions),
                     ai_suggest_col,
                 ],
                 scroll=ft.ScrollMode.AUTO,
@@ -2243,8 +2252,8 @@ def main(page: ft.Page):
         tf_barcode = ft.TextField(
             label="Código de barras (EAN-13) o JSON QR",
             bgcolor="#ffffff",
-            border_radius=14,
-            border_color="#e2e8f0",
+            border_radius=10,
+            border_color="#E4DFD3",
         )
 
         camera_holder = ft.Container(visible=False)
@@ -2252,7 +2261,7 @@ def main(page: ft.Page):
         def process_code_string(code_str):
             code_str = (code_str or "").strip()
             if not code_str:
-                notify("Introduce o escanea un código primero", "#ef4444")
+                notify("Introduce o escanea un código primero", "#B8453A")
                 return
 
             try:
@@ -2283,11 +2292,11 @@ def main(page: ft.Page):
                         )
                         return
                     else:
-                        notify("Código no encontrado en OpenFoodFacts", "#ef4444")
+                        notify("Código no encontrado en OpenFoodFacts", "#B8453A")
                 except Exception:
-                    notify("Error al conectar con OpenFoodFacts", "#ef4444")
+                    notify("Error al conectar con OpenFoodFacts", "#B8453A")
             else:
-                notify("Formato de código no reconocido", "#ef4444")
+                notify("Formato de código no reconocido", "#B8453A")
 
         scan_state = {"active": False}
 
@@ -2326,7 +2335,7 @@ def main(page: ft.Page):
             try:
                 cam = fc.Camera(expand=True, preview_enabled=True)
             except Exception as ex:
-                notify(f"Cámara no disponible: {ex}", "#ef4444")
+                notify(f"Cámara no disponible: {ex}", "#B8453A")
                 return
 
             async def capture_and_decode(ev=None):
@@ -2348,7 +2357,7 @@ def main(page: ft.Page):
             async def manual_capture(ev):
                 ok = await capture_and_decode()
                 if not ok:
-                    notify("No se detectó ningún código. Acércalo más.", "#f59e0b")
+                    notify("No se detectó ningún código. Acércalo más.", "#C9763F")
 
             async def auto_scan_loop():
                 import asyncio
@@ -2362,26 +2371,26 @@ def main(page: ft.Page):
             camera_holder.content = ft.Container(
                 bgcolor="#ffffff",
                 padding=14,
-                border_radius=20,
-                shadow=CARD_SHADOW,
+                border_radius=12,
+                shadow=CARD_SHADOW, border=CARD_BORDER,
                 content=ft.Column(
                     [
                         ft.Container(
                             height=280,
-                            border_radius=16,
-                            bgcolor="#0f172a",
+                            border_radius=10,
+                            bgcolor="#1C1B18",
                             clip_behavior=ft.ClipBehavior.HARD_EDGE,
                             content=cam,
                         ),
                         ft.Text(
                             "Escaneando automáticamente… apunta al código",
                             size=12,
-                            color="#64748b",
+                            color="#77736A",
                         ),
                         ft.Row(
                             [
-                                make_button("📸 Capturar", "#1d8cf8", manual_capture, expand=True),
-                                make_button("✖ Cerrar", "#ef4444", close_camera_inline, expand=True),
+                                make_button("📸 Capturar", "#24543F", manual_capture, expand=True),
+                                make_button("✖ Cerrar", "#B8453A", close_camera_inline, expand=True),
                             ],
                             spacing=10,
                         ),
@@ -2396,7 +2405,7 @@ def main(page: ft.Page):
             try:
                 cameras = await cam.get_available_cameras()
                 if not cameras:
-                    notify("No se encontró ninguna cámara", "#ef4444")
+                    notify("No se encontró ninguna cámara", "#B8453A")
                     close_camera_inline()
                     return
                 # Preferir la cámara trasera
@@ -2410,7 +2419,7 @@ def main(page: ft.Page):
                     enable_audio=False,  # no pedir micrófono
                 )
             except Exception as ex:
-                notify(f"No se pudo abrir la cámara: {ex}", "#ef4444")
+                notify(f"No se pudo abrir la cámara: {ex}", "#B8453A")
                 close_camera_inline()
                 return
 
@@ -2421,30 +2430,30 @@ def main(page: ft.Page):
             expand=True,
             content=ft.Column(
                 [
-                    ft.Text("Escáner", size=24, weight="bold", color="#1e293b"),
+                    ft.Text("Escáner", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     camera_holder,
                     ft.Container(
                         bgcolor="#ffffff",
                         padding=22,
-                        border_radius=24,
-                        shadow=CARD_SHADOW,
+                        border_radius=14,
+                        shadow=CARD_SHADOW, border=CARD_BORDER,
                         content=ft.Column(
                             [
-                                ft.Text("📷", size=48),
+                                ft.Icon(ft.Icons.QR_CODE_SCANNER, size=44, color="#24543F"),
                                 ft.Text(
-                                    "Escanear Código QR",
+                                    "Escanear código",
                                     size=18,
-                                    weight="bold",
-                                    color="#1e293b",
+                                    weight=ft.FontWeight.W_600,
+                                    color="#1C1B18",
                                 ),
                                 ft.Text(
                                     "Abre la cámara integrada para leer un código QR nutricional o escribe el código de barras debajo.",
                                     text_align="center",
-                                    color="#64748b",
+                                    color="#77736A",
                                     size=13,
                                 ),
                                 make_button(
-                                    "Abrir Cámara QR", "#1d8cf8", open_camera_inline
+                                    "Abrir cámara", "#24543F", open_camera_inline
                                 ),
                             ],
                             horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -2452,15 +2461,15 @@ def main(page: ft.Page):
                         ),
                     ),
                     ft.Text(
-                        "Código de Barras (EAN-13) o JSON:",
-                        weight="bold",
-                        color="#64748b",
+                        "Código de barras o JSON",
+                        weight=ft.FontWeight.W_600,
+                        color="#77736A",
                         size=13,
                     ),
                     tf_barcode,
                     make_button(
-                        "🔍 Buscar Producto",
-                        "#10b981",
+                        "Buscar producto",
+                        "#3F7D58",
                         lambda e: process_code_string(tf_barcode.value),
                     ),
                 ],
@@ -2482,28 +2491,28 @@ def main(page: ft.Page):
                 ft.Container(
                     bgcolor="#ffffff",
                     padding=20,
-                    border_radius=24,
-                    shadow=CARD_SHADOW,
+                    border_radius=14,
+                    shadow=CARD_SHADOW, border=CARD_BORDER,
                     content=ft.Column(
                         [
-                            ft.Text(uav, size=48),
-                            ft.Text(uname, size=22, weight="bold", color="#1e293b"),
+                            avatar_chip(uname, 64),
+                            ft.Text(uname, size=22, weight=ft.FontWeight.W_600, color="#1C1B18"),
                             ft.Text(
                                 f"{ugen} • {uage} años • {int(uw)} kg • {int(uh)} cm",
                                 size=13,
-                                color="#64748b",
+                                color="#77736A",
                             ),
-                            ft.Divider(color="#f1f5f9"),
+                            ft.Divider(color="#F4F1EA"),
                             ft.Text(
                                 f"Actividad: {uact}  |  Objetivo: {ugoal}",
                                 size=13,
-                                weight="bold",
-                                color="#1d8cf8",
+                                weight=ft.FontWeight.W_600,
+                                color="#24543F",
                             ),
                             ft.Text(
                                 f"Meta diaria: {int(ukcal)} kcal (P: {int(up)}g • C: {int(uc)}g • G: {int(uf)}g)",
                                 size=13,
-                                color="#334155",
+                                color="#3A3832",
                             ),
                         ],
                         horizontal_alignment=ft.CrossAxisAlignment.CENTER,
@@ -2511,15 +2520,15 @@ def main(page: ft.Page):
                     ),
                 ),
                 make_button(
-                    "⚡ Recalibrar Edad, Peso y Calorías",
-                    "#1d8cf8",
+                    "Recalcular objetivo",
+                    "#24543F",
                     lambda e: show_onboarding_wizard(
                         is_first_user=False, edit_user_data=u
                     ),
                 ),
                 make_button(
-                    "👥 Cambiar o Añadir Usuario",
-                    "#334155",
+                    "Cambiar de perfil",
+                    "#3A3832",
                     show_user_selector,
                 ),
             ]
@@ -2530,7 +2539,7 @@ def main(page: ft.Page):
             expand=True,
             content=ft.Column(
                 [
-                    ft.Text("Mi Perfil", size=24, weight="bold", color="#1e293b"),
+                    ft.Text("Perfil", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     profile_summary_col,
                 ],
                 scroll=ft.ScrollMode.AUTO,
@@ -2543,15 +2552,28 @@ def main(page: ft.Page):
         nav_index = [0]
         content_area = ft.Container(expand=True)
         views_list = [view_home, view_add, view_ai, view_scan, view_profile]
-        nav_buttons = []
+        nav_bar = ft.NavigationBar(
+            selected_index=0,
+            bgcolor="#FFFFFF",
+            indicator_color="#E3ECE6",
+            elevation=0,
+            height=64,
+            border=ft.Border(top=ft.BorderSide(1, "#E4DFD3")),
+            label_behavior=ft.NavigationBarLabelBehavior.ALWAYS_SHOW,
+            on_change=lambda e: switch_tab(e.control.selected_index),
+            destinations=[
+                ft.NavigationBarDestination(icon=ft.Icons.HOME_OUTLINED, selected_icon=ft.Icons.HOME, label="Hoy"),
+                ft.NavigationBarDestination(icon=ft.Icons.ADD_CIRCLE_OUTLINE, selected_icon=ft.Icons.ADD_CIRCLE, label="Añadir"),
+                ft.NavigationBarDestination(icon=ft.Icons.AUTO_AWESOME_OUTLINED, selected_icon=ft.Icons.AUTO_AWESOME, label="IA"),
+                ft.NavigationBarDestination(icon=ft.Icons.QR_CODE_SCANNER, selected_icon=ft.Icons.QR_CODE_SCANNER, label="Escáner"),
+                ft.NavigationBarDestination(icon=ft.Icons.PERSON_OUTLINE, selected_icon=ft.Icons.PERSON, label="Perfil"),
+            ],
+        )
 
         def switch_tab(index):
             nav_index[0] = index
             content_area.content = views_list[index]
-            for i, btn in enumerate(nav_buttons):
-                active = nav_index[0] == i
-                btn.content.controls[0].color = "#1d8cf8" if active else "#94a3b8"
-                btn.content.controls[1].color = "#1d8cf8" if active else "#94a3b8"
+            nav_bar.selected_index = index
             if index != 3 and scan_state["active"]:
                 close_camera_inline()
             if index == 0:
@@ -2561,31 +2583,6 @@ def main(page: ft.Page):
             elif index == 4:
                 refresh_profile_tab()
             page.update()
-
-        for i, (icon, label) in enumerate(
-            [("🏠", "Hoy"), ("➕", "Añadir"), ("🤖", "IA"), ("📷", "Escáner"), ("👤", "Perfil")]
-        ):
-            nav_buttons.append(
-                ft.Container(
-                    expand=True,
-                    padding=8,
-                    on_click=lambda e, idx=i: switch_tab(idx),
-                    content=ft.Column(
-                        [
-                            ft.Text(icon, size=20, color="#94a3b8"),
-                            ft.Text(label, size=11, color="#94a3b8", weight="bold"),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=2,
-                    ),
-                )
-            )
-
-        nav_bar = ft.Container(
-            bgcolor="#ffffff",
-            padding=ft.Padding(left=6, right=6, top=6, bottom=18),
-            content=ft.Row(nav_buttons, alignment=ft.MainAxisAlignment.SPACE_AROUND),
-        )
 
         root_container.content = ft.Column(
             [top_bar, content_area, nav_bar],
