@@ -2,8 +2,11 @@ import json
 import sqlite3
 import threading
 import cv2
+import numpy as np
 import flet as ft
 import requests
+import flet_camera as fc
+import os
 
 
 # ==========================================
@@ -207,7 +210,7 @@ def main(page: ft.Page):
                     content=bar,
                     width=85,
                     border_radius=4,
-                    padding=8,  # Usando padding numérico directo seguro
+                    padding=8,
                 ),
                 val_txt,
             ],
@@ -898,7 +901,7 @@ def main(page: ft.Page):
     )
 
     # ==========================================
-    # CAPA 3: ESCÁNER QR
+    # CAPA 3: ESCÁNER QR (CON CÁMARA DEL DISPOSITIVO)
     # ==========================================
     tf_barcode = ft.TextField(
         label="Código de barras (EAN-13) o JSON QR",
@@ -951,40 +954,58 @@ def main(page: ft.Page):
             notify("Formato de código no reconocido", "#ef4444")
 
     def open_camera_scanner(e):
-        def cam_worker():
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                notify("No se pudo abrir la cámara web", "#ef4444")
-                return
-            detector = cv2.QRCodeDetector()
-            found = None
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                cv2.putText(
-                    frame,
-                    "Apunta al QR (Pulsa 'Q' para salir)",
-                    (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.65,
-                    (0, 200, 100),
-                    2,
-                )
-                data, _, _ = detector.detectAndDecode(frame)
-                if data:
-                    found = data
-                    break
-                cv2.imshow("Escaner QR - GymMacro", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            cap.release()
-            cv2.destroyAllWindows()
-            if found:
-                tf_barcode.value = found
-                process_code_string(found)
+        # Componente de cámara de Flet (funciona en Web/Móvil)
+        cam = fc.Camera(
+            expand=True,
+            preview_enabled=True,
+        )
 
-        threading.Thread(target=cam_worker, daemon=True).start()
+        def on_capture(e):
+            image_bytes = cam.get_image_bytes()
+            if not image_bytes:
+                notify("No se pudo capturar la imagen", "#ef4444")
+                return
+
+            # Decodificar QR en el servidor con OpenCV
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                notify("Imagen inválida", "#ef4444")
+                return
+
+            detector = cv2.QRCodeDetector()
+            data, _, _ = detector.detectAndDecode(img)
+
+            if data:
+                tf_barcode.value = data
+                process_code_string(data)
+                page.views.pop()  # Cerrar vista de cámara
+                page.update()
+            else:
+                notify("No se detectó ningún QR en la imagen", "#ef4444")
+
+        btn_capture = ft.ElevatedButton(
+            "📸 Capturar y Escanear",
+            on_click=on_capture,
+            bgcolor="#1d8cf8",
+            color="white",
+        )
+
+        page.views.append(
+            ft.View(
+                "/camara",
+                [
+                    ft.AppBar(title=ft.Text("Escáner QR"), bgcolor="#1d8cf8"),
+                    cam,
+                    ft.Container(
+                        content=btn_capture,
+                        alignment=ft.alignment.center,
+                        padding=20,
+                    ),
+                ],
+            )
+        )
+        page.update()
 
     view_scan = ft.Container(
         padding=20,
@@ -1084,7 +1105,6 @@ def main(page: ft.Page):
 
     gender_row = ft.Row(spacing=10)
     act_row = ft.Row(spacing=6, wrap=True)
-
     def render_gender_pills():
         gender_row.controls.clear()
         for g in ("Hombre", "Mujer"):
@@ -1095,279 +1115,169 @@ def main(page: ft.Page):
                     padding=12,
                     border_radius=14,
                     expand=True,
-                    on_click=lambda e, val=g: set_gender(val),
+                    on_click=lambda e, gg=g: set_gender(gg),
                     content=ft.Row(
-                        [
-                            ft.Text(
-                                g,
-                                color="white" if active else "#64748b",
-                                weight="bold",
-                            )
-                        ],
+                        [ft.Text(g, size=13, weight="bold",
+                                 color="white" if active else "#64748b")],
                         alignment=ft.MainAxisAlignment.CENTER,
                     ),
                 )
             )
 
-    def set_gender(val):
-        selected_gender[0] = val
+    def set_gender(g):
+        selected_gender[0] = g
         render_gender_pills()
         page.update()
 
+    render_gender_pills()
+
     def render_act_pills():
         act_row.controls.clear()
-        for k in act_multipliers.keys():
-            active = selected_act[0] == k
+        for name in act_multipliers:
+            active = selected_act[0] == name
             act_row.controls.append(
                 ft.Container(
                     bgcolor="#1d8cf8" if active else "#ffffff",
                     padding=10,
-                    border_radius=12,
-                    on_click=lambda e, val=k: set_act(val),
+                    border_radius=14,
+                    on_click=lambda e, n=name: set_activity(n),
                     content=ft.Text(
-                        k,
-                        size=12,
+                        name, size=12, weight="bold",
                         color="white" if active else "#64748b",
-                        weight="bold",
                     ),
                 )
             )
 
-    def set_act(val):
-        selected_act[0] = val
+    def set_activity(name):
+        selected_act[0] = name
         render_act_pills()
         page.update()
 
-    render_gender_pills()
     render_act_pills()
 
-    lbl_offset = ft.Text(
-        f"Déficit / Superávit: {int(poff):+d} kcal",
-        weight="bold",
-        color="#1e293b",
+    lbl_calc_result = ft.Text(
+        "", size=14, color="#1d8cf8", weight="bold", text_align="center"
     )
 
-    def on_slider_change(e):
-        val = int(e.control.value)
-        lbl_offset.value = f"Déficit / Superávit: {val:+d} kcal"
-        page.update()
-
-    sld_offset = ft.Slider(
-        min=-1000,
-        max=1000,
-        divisions=40,
-        value=poff,
-        active_color="#1d8cf8",
-        on_change=on_slider_change,
-    )
-
-    lbl_bmr_info = ft.Text(
-        "Calcula tu TMB con la ecuación de Harris-Benedict",
-        color="#1d8cf8",
-        size=13,
-    )
-
-    tf_tkcal = ft.TextField(
-        label="Objetivo Kcal",
-        value=str(int(ptkcal)),
-        bgcolor="#ffffff",
-        border_radius=14,
-        border_color="#e2e8f0",
-        expand=True,
-    )
-    tf_burned = ft.TextField(
-        label="Kcal Quemadas",
-        value=str(int(pburned)),
-        bgcolor="#ffffff",
-        border_radius=14,
-        border_color="#e2e8f0",
-        expand=True,
-    )
-    tf_tc = ft.TextField(
-        label="Carbohidratos (g)",
-        value=str(int(ptc)),
-        bgcolor="#ffffff",
-        border_radius=14,
-        border_color="#e2e8f0",
-        expand=True,
-    )
-    tf_tp = ft.TextField(
-        label="Proteínas (g)",
-        value=str(int(ptp)),
-        bgcolor="#ffffff",
-        border_radius=14,
-        border_color="#e2e8f0",
-        expand=True,
-    )
-    tf_tf = ft.TextField(
-        label="Grasas (g)",
-        value=str(int(ptf)),
-        bgcolor="#ffffff",
-        border_radius=14,
-        border_color="#e2e8f0",
-        expand=True,
-    )
-
-    def calc_harris_benedict(e):
+    def calculate_and_save_profile(e):
         try:
-            w, h, a = float(tf_w.value), float(tf_h.value), int(tf_a.value)
+            w = float(tf_w.value)
+            h = float(tf_h.value)
+            a = int(float(tf_a.value))
+            # Harris-Benedict
             if selected_gender[0] == "Hombre":
-                bmr = 66.473 + (13.7516 * w) + (5.0033 * h) - (6.755 * a)
+                bmr = 88.362 + (13.397 * w) + (4.799 * h) - (5.677 * a)
             else:
-                bmr = 655.0955 + (9.5634 * w) + (1.8496 * h) - (4.6756 * a)
+                bmr = 447.593 + (9.247 * w) + (3.098 * h) - (4.330 * a)
 
             tdee = bmr * act_multipliers[selected_act[0]]
-            target = tdee + float(sld_offset.value)
+            target_kcal = tdee
+            target_p = w * 1.8          # ~1.8 g/kg proteína
+            target_f = w * 0.9          # ~0.9 g/kg grasas
+            target_c = max(0, (target_kcal - (target_p * 4) - (target_f * 9)) / 4)
 
-            p_g = round(w * 2.0)
-            f_g = round(w * 0.9)
-            c_g = max(0, round((target - (p_g * 4) - (f_g * 9)) / 4))
+            db.save_profile((
+                w, h, a, selected_gender[0], selected_act[0], 0.0,
+                target_kcal, target_p, target_c, target_f, pburned,
+            ))
 
-            lbl_bmr_info.value = (
-                f"TMB: {int(bmr)} kcal  |  Mantenimiento: {int(tdee)} kcal"
+            lbl_calc_result.value = (
+                f"Objetivo: {int(target_kcal)} kcal | "
+                f"P: {int(target_p)}g  C: {int(target_c)}g  G: {int(target_f)}g"
             )
-            tf_tkcal.value = str(int(target))
-            tf_tp.value = str(p_g)
-            tf_tc.value = str(c_g)
-            tf_tf.value = str(f_g)
-            notify("Calculado con Harris-Benedict")
+            notify("Perfil guardado y objetivos recalculados", "#10b981")
+            refresh_dashboard()
         except ValueError:
-            notify("Revisa Peso, Altura y Edad", "#ef4444")
-
-    def save_profile_changes(e):
-        try:
-            db.save_profile(
-                (
-                    float(tf_w.value),
-                    float(tf_h.value),
-                    int(tf_a.value),
-                    selected_gender[0],
-                    selected_act[0],
-                    float(sld_offset.value),
-                    float(tf_tkcal.value),
-                    float(tf_tp.value),
-                    float(tf_tc.value),
-                    float(tf_tf.value),
-                    float(tf_burned.value),
-                )
-            )
-            notify("¡Objetivos actualizados!", "#10b981")
-            switch_tab(0)
-        except ValueError:
-            notify("Revisa que todos los límites sean números", "#ef4444")
+            notify("Revisa los valores numéricos del perfil", "#ef4444")
 
     view_profile = ft.Container(
         padding=20,
         expand=True,
         content=ft.Column(
             [
-                ft.Text("Mi Perfil", size=28, weight="bold", color="#1e293b"),
-                ft.Row([tf_w, tf_h, tf_a]),
+                ft.Text("Perfil", size=28, weight="bold", color="#1e293b"),
+                ft.Text("Datos para el cálculo de calorías (Harris-Benedict)",
+                        size=13, color="#64748b"),
                 ft.Text("Sexo:", size=13, color="#64748b", weight="bold"),
                 gender_row,
-                ft.Text(
-                    "Nivel de Ejercicio Físico:",
-                    size=13,
-                    color="#64748b",
-                    weight="bold",
-                ),
+                ft.Row([tf_w, tf_h]),
+                tf_a,
+                ft.Text("Nivel de actividad:", size=13,
+                        color="#64748b", weight="bold"),
                 act_row,
-                lbl_offset,
-                sld_offset,
-                make_button(
-                    "⚡ Calcular con Harris-Benedict",
-                    "#1d8cf8",
-                    calc_harris_benedict,
-                ),
-                lbl_bmr_info,
-                ft.Divider(color="#e2e8f0"),
-                ft.Text(
-                    "Tus Límites Diarios (Editables):",
-                    size=14,
-                    weight="bold",
-                    color="#64748b",
-                ),
-                ft.Row([tf_tkcal, tf_burned]),
-                ft.Row([tf_tc, tf_tp, tf_tf]),
-                make_button(
-                    "💾 Guardar Objetivos", "#5cd6c0", save_profile_changes
-                ),
+                make_button("💾 Calcular y Guardar Perfil",
+                            "#1d8cf8", calculate_and_save_profile),
+                lbl_calc_result,
             ],
             scroll=ft.ScrollMode.AUTO,
             expand=True,
-            spacing=11,
+            spacing=12,
         ),
     )
 
     # ==========================================
-    # BARRA DE NAVEGACIÓN INFERIOR
+    # NAVEGACIÓN INFERIOR
     # ==========================================
-    body_container = ft.Container(content=view_home, expand=True)
-    nav_row = ft.Row(alignment=ft.MainAxisAlignment.SPACE_AROUND)
+    nav_index = [0]
+    content_area = ft.Container(expand=True)
 
-    tabs_meta = [
-        ("📊", "Hoy", view_home),
-        ("➕", "Añadir", view_add),
-        ("📷", "Escáner", view_scan),
-        ("⚙️", "Perfil", view_profile),
-    ]
-    current_tab = [0]
-
-    def render_nav_bar():
-        nav_row.controls.clear()
-        for idx, (emoji, title, _) in enumerate(tabs_meta):
-            is_active = current_tab[0] == idx
-            nav_row.controls.append(
-                ft.Container(
-                    padding=10,
-                    border_radius=16,
-                    bgcolor="#eff6ff" if is_active else "transparent",
-                    on_click=lambda e, i=idx: switch_tab(i),
-                    content=ft.Column(
-                        [
-                            ft.Text(emoji, size=19),
-                            ft.Text(
-                                title,
-                                size=11,
-                                weight="bold" if is_active else "normal",
-                                color="#1d8cf8" if is_active else "#94a3b8",
-                            ),
-                        ],
-                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                        spacing=2,
-                    ),
-                )
-            )
+    views_list = [view_home, view_add, view_scan, view_profile]
 
     def switch_tab(index):
-        current_tab[0] = index
+        nav_index[0] = index
+        content_area.content = views_list[index]
+        update_nav()
         if index == 0:
             refresh_dashboard()
-        body_container.content = tabs_meta[index][2]
-        render_nav_bar()
         page.update()
 
-    bottom_bar = ft.Container(
+    nav_buttons = []
+
+    def update_nav():
+        labels = [("🏠", "Hoy"), ("➕", "Añadir"),
+                  ("📷", "Escáner"), ("👤", "Perfil")]
+        for i, btn in enumerate(nav_buttons):
+            active = nav_index[0] == i
+            btn.content.controls[0].color = "#1d8cf8" if active else "#94a3b8"
+            btn.content.controls[1].color = "#1d8cf8" if active else "#94a3b8"
+
+    for i, (icon, label) in enumerate(
+        [("🏠", "Hoy"), ("➕", "Añadir"), ("📷", "Escáner"), ("👤", "Perfil")]
+    ):
+        nav_buttons.append(
+            ft.Container(
+                expand=True,
+                padding=8,
+                on_click=lambda e, idx=i: switch_tab(idx),
+                content=ft.Column(
+                    [
+                        ft.Text(icon, size=20, color="#94a3b8"),
+                        ft.Text(label, size=11, color="#94a3b8"),
+                    ],
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=0,
+                ),
+            )
+        )
+
+    nav_bar = ft.Container(
         bgcolor="#ffffff",
         padding=6,
-        shadow=ft.BoxShadow(
-            spread_radius=0, blur_radius=12, color="#0d000000"
-        ),
-        content=nav_row,
+        content=ft.Row(nav_buttons, alignment=ft.MainAxisAlignment.SPACE_AROUND),
     )
 
-    render_nav_bar()
+    # ==========================================
+    # LAYOUT PRINCIPAL
+    # ==========================================
     page.add(
-        ft.Column(
-            [status_banner, body_container, bottom_bar],
-            expand=True,
-            spacing=0,
-        )
+        status_banner,
+        content_area,
+        nav_bar,
     )
-    refresh_dashboard()
+
+    switch_tab(0)
+
 
 if __name__ == "__main__":
-    import os
-    # Render usa la variable PORT y requiere host 0.0.0.0
     port = int(os.getenv("PORT", 8550))
     ft.run(main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")

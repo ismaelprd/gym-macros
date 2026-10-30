@@ -1,3 +1,4 @@
 flet
 requests
 opencv-python-headless
+flet-camera
