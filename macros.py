@@ -1368,7 +1368,5 @@ def main(page: ft.Page):
 
 
 if __name__ == "__main__":
-    if hasattr(ft, "run"):
-        ft.run(main)
-    else:
-        ft.app(target=main)
+    # Forzar ejecución web optimizada para la nube
+    ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=8550)
