@@ -1705,39 +1705,75 @@ def main(page: ft.Page):
             else:
                 notify("Formato de código no reconocido", "#ef4444")
 
-        def open_camera_inline(e):
+        scan_state = {"active": False}
+
+        def decode_frame(image_bytes):
+            """Devuelve el texto de un QR o código de barras, o '' si no hay."""
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return ""
+            # 1) QR
+            try:
+                data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+                if data:
+                    return data
+            except Exception:
+                pass
+            # 2) Código de barras EAN/UPC (si tu OpenCV lo incluye)
+            try:
+                bd = cv2.barcode.BarcodeDetector()
+                ok, infos, _, _ = bd.detectAndDecodeWithType(img)
+                if ok:
+                    for d in infos:
+                        if d:
+                            return d
+            except Exception:
+                pass
+            return ""
+
+        def close_camera_inline(ev=None):
+            scan_state["active"] = False
+            camera_holder.visible = False
+            camera_holder.content = None
+            page.update()
+
+        async def open_camera_inline(e):
             try:
                 cam = fc.Camera(expand=True, preview_enabled=True)
             except Exception as ex:
                 notify(f"Cámara no disponible: {ex}", "#ef4444")
                 return
 
-            def capture_and_decode(ev):
+            async def capture_and_decode(ev=None):
                 try:
-                    image_bytes = cam.get_image_bytes()
+                    image_bytes = await cam.take_picture()
                     if not image_bytes:
-                        notify("No se pudo capturar el fotograma", "#ef4444")
-                        return
-                    nparr = np.frombuffer(image_bytes, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                    if img is None:
-                        notify("Imagen inválida", "#ef4444")
-                        return
-                    detector = cv2.QRCodeDetector()
-                    data, _, _ = detector.detectAndDecode(img)
+                        return False
+                    data = decode_frame(image_bytes)
                     if data:
+                        scan_state["active"] = False
                         tf_barcode.value = data
-                        close_camera_inline(None)
+                        close_camera_inline()
                         process_code_string(data)
-                    else:
-                        notify("No se detectó ningún QR. Acerca más el código.", "#f59e0b")
-                except Exception:
-                    notify("Error al procesar la imagen de la cámara", "#ef4444")
+                        return True
+                except Exception as ex:
+                    print("Error captura:", ex)
+                return False
 
-            def close_camera_inline(ev):
-                camera_holder.visible = False
-                camera_holder.content = None
-                page.update()
+            async def manual_capture(ev):
+                ok = await capture_and_decode()
+                if not ok:
+                    notify("No se detectó ningún código. Acércalo más.", "#f59e0b")
+
+            async def auto_scan_loop():
+                import asyncio
+                scan_state["active"] = True
+                await asyncio.sleep(1.0)
+                while scan_state["active"]:
+                    if await capture_and_decode():
+                        break
+                    await asyncio.sleep(0.7)
 
             camera_holder.content = ft.Container(
                 bgcolor="#ffffff",
@@ -1750,22 +1786,18 @@ def main(page: ft.Page):
                             height=280,
                             border_radius=16,
                             bgcolor="#0f172a",
+                            clip_behavior=ft.ClipBehavior.HARD_EDGE,
                             content=cam,
+                        ),
+                        ft.Text(
+                            "Escaneando automáticamente… apunta al código",
+                            size=12,
+                            color="#64748b",
                         ),
                         ft.Row(
                             [
-                                make_button(
-                                    "📸 Capturar QR",
-                                    "#1d8cf8",
-                                    capture_and_decode,
-                                    expand=True,
-                                ),
-                                make_button(
-                                    "✖ Cerrar",
-                                    "#ef4444",
-                                    close_camera_inline,
-                                    expand=True,
-                                ),
+                                make_button("📸 Capturar", "#1d8cf8", manual_capture, expand=True),
+                                make_button("✖ Cerrar", "#ef4444", close_camera_inline, expand=True),
                             ],
                             spacing=10,
                         ),
@@ -1775,6 +1807,30 @@ def main(page: ft.Page):
             )
             camera_holder.visible = True
             page.update()
+
+            # Inicializar la cámara (OBLIGATORIO antes de usarla)
+            try:
+                cameras = await cam.get_available_cameras()
+                if not cameras:
+                    notify("No se encontró ninguna cámara", "#ef4444")
+                    close_camera_inline()
+                    return
+                # Preferir la cámara trasera
+                chosen = next(
+                    (c for c in cameras if c.lens_direction == fc.CameraLensDirection.BACK),
+                    cameras[0],
+                )
+                await cam.initialize(
+                    description=chosen,
+                    resolution_preset=fc.ResolutionPreset.HIGH,
+                    enable_audio=False,  # no pedir micrófono
+                )
+            except Exception as ex:
+                notify(f"No se pudo abrir la cámara: {ex}", "#ef4444")
+                close_camera_inline()
+                return
+
+            page.run_task(auto_scan_loop)
 
         view_scan = ft.Container(
             padding=18,

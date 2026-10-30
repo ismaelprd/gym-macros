@@ -1,4 +1,7 @@
-flet
-requests
+flet==1.0.5
+flet-cli==1.0.5
+flet-web==1.0.5
+flet-camera==1.0.5
 opencv-python-headless
-flet-camera
+numpy
+requests
