@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -72,6 +74,19 @@ class DatabaseManager:
         except Exception:
             pass
 
+        try:
+            self.cursor.execute("ALTER TABLE food_log ADD COLUMN image TEXT")
+        except Exception:
+            pass
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS saved_meals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                meal_type TEXT,
+                items TEXT
+            )
+        """)
         self.conn.commit()
 
     def get_all_users(self):
@@ -189,23 +204,24 @@ class DatabaseManager:
 
     def delete_user(self, user_id):
         self.cursor.execute("DELETE FROM food_log WHERE user_id = ?", (user_id,))
+        self.cursor.execute("DELETE FROM saved_meals WHERE user_id = ?", (user_id,))
         self.cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.conn.commit()
 
-    def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f):
+    def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None):
         self.cursor.execute(
             """
-            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (user_id, meal_type, name, grams, kcal, p, c, f),
+            (user_id, meal_type, name, grams, kcal, p, c, f, image),
         )
         self.conn.commit()
 
     def get_today_foods(self, user_id):
         self.cursor.execute(
             """
-            SELECT id, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f
+            SELECT id, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image
             FROM food_log
             WHERE user_id = ? AND date = DATE('now', 'localtime')
         """,
@@ -215,6 +231,31 @@ class DatabaseManager:
 
     def delete_food(self, food_id):
         self.cursor.execute("DELETE FROM food_log WHERE id = ?", (food_id,))
+        self.conn.commit()
+
+    # ----- Comidas fijas -----
+    def save_meal(self, user_id, name, meal_type, items):
+        self.cursor.execute(
+            "INSERT INTO saved_meals (user_id, name, meal_type, items) VALUES (?, ?, ?, ?)",
+            (user_id, name, meal_type, json.dumps(items, ensure_ascii=False)),
+        )
+        self.conn.commit()
+
+    def get_saved_meals(self, user_id):
+        self.cursor.execute(
+            "SELECT id, name, meal_type, items FROM saved_meals WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        )
+        out = []
+        for sid, name, mt, items in self.cursor.fetchall():
+            try:
+                out.append((sid, name, mt, json.loads(items)))
+            except Exception:
+                pass
+        return out
+
+    def delete_saved_meal(self, saved_id):
+        self.cursor.execute("DELETE FROM saved_meals WHERE id = ?", (saved_id,))
         self.conn.commit()
 
 
@@ -255,10 +296,154 @@ def compute_macros(weight, height, age, gender, activity, goal_name):
 
 
 # ==========================================
+# IA (Gemini) + UTILIDADES
+# ==========================================
+AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+
+def ask_ai(system_prompt, user_text, max_tokens=1800):
+    key = os.getenv("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("Falta la variable GEMINI_API_KEY en Render")
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent",
+        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+        json={
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.4,
+            },
+        },
+        timeout=45,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(f"Error {resp.status_code}: {resp.text[:150]}")
+    data = resp.json()
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+    except Exception:
+        raise RuntimeError("Gemini no devolvió respuesta (¿contenido bloqueado?)")
+    return "".join(p.get("text", "") for p in parts if not p.get("thought"))
+
+
+def extract_json(text):
+    text = re.sub(r"```(?:json)?", "", text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    i, j = text.find("{"), text.rfind("}")
+    if i != -1 and j > i:
+        return json.loads(text[i : j + 1])
+    raise ValueError("La IA no devolvió un resultado válido")
+
+
+def _num(v):
+    try:
+        return max(0.0, float(v))
+    except Exception:
+        return 0.0
+
+
+FOOD_PARSE_PROMPT = (
+    "Eres un nutricionista experto. El usuario describe en español lo que ha comido. "
+    'Devuelve SOLO un JSON con este formato exacto: {"items":[{"name":"...","grams":123,'
+    '"kcal":0,"p":0,"c":0,"f":0}]}. Reglas: un elemento por alimento; "grams" es el peso '
+    "estimado en gramos de la porción realmente comida (si el usuario da gramos, respétalos; "
+    "si usa medidas caseras como rebanadas, cucharadas, piezas, vasos o puñados, conviértelas "
+    "a gramos con equivalencias típicas); kcal, p (proteína), c (carbohidratos) y f (grasa) "
+    "son los TOTALES de esa porción, no por 100 g; valores realistas; nada de texto fuera del JSON."
+)
+
+SUGGEST_PROMPT = (
+    "Eres un nutricionista deportivo. Propón EXACTAMENTE 3 opciones (comida, snack o mini-receta) "
+    "para que el usuario complete su día SIN SUPERAR las calorías restantes. Devuelve SOLO JSON: "
+    '{"options":[{"title":"...","description":"una frase","grams":0,"kcal":0,"p":0,"c":0,"f":0,'
+    '"ingredients":["cantidad + ingrediente"],"steps":["paso corto"]}]}. Reglas: las kcal de cada '
+    "opción deben ser MENORES O IGUALES que las calorías restantes (idealmente entre el 70% y el "
+    "100%); prioriza cubrir la proteína restante sin pasarte de carbohidratos ni grasas restantes; "
+    "ingredientes comunes y baratos; máximo 4 pasos breves; los macros son totales de la opción."
+)
+
+
+def ai_parse_foods(description):
+    data = extract_json(ask_ai(FOOD_PARSE_PROMPT, description))
+    items = []
+    for it in data.get("items", []):
+        name = str(it.get("name", "")).strip()
+        grams = _num(it.get("grams"))
+        if name and grams > 0:
+            items.append(
+                {
+                    "name": name,
+                    "grams": round(grams),
+                    "kcal": round(_num(it.get("kcal")), 1),
+                    "p": round(_num(it.get("p")), 1),
+                    "c": round(_num(it.get("c")), 1),
+                    "f": round(_num(it.get("f")), 1),
+                }
+            )
+    if not items:
+        raise ValueError("No pude identificar alimentos. Prueba a describirlo de otra forma.")
+    return items
+
+
+def ai_suggest(remaining, eaten_names, meal_name):
+    user_text = (
+        f"Tipo de comida: {meal_name}. Restante hoy: {int(remaining['kcal'])} kcal, "
+        f"{int(remaining['p'])} g proteína, {int(remaining['c'])} g carbohidratos, "
+        f"{int(remaining['f'])} g grasa. Ya ha comido hoy: {', '.join(eaten_names) or 'nada aún'}."
+    )
+    data = extract_json(ask_ai(SUGGEST_PROMPT, user_text, max_tokens=2200))
+    options = []
+    for o in data.get("options", []):
+        kcal = _num(o.get("kcal"))
+        # Garantía de "sin pasarte": descartamos lo que supere lo restante
+        if o.get("title") and 0 < kcal <= remaining["kcal"]:
+            options.append(
+                {
+                    "title": str(o["title"]),
+                    "description": str(o.get("description", "")),
+                    "grams": round(_num(o.get("grams")) or 100),
+                    "kcal": round(kcal, 1),
+                    "p": round(_num(o.get("p")), 1),
+                    "c": round(_num(o.get("c")), 1),
+                    "f": round(_num(o.get("f")), 1),
+                    "ingredients": [str(x) for x in o.get("ingredients", [])][:10],
+                    "steps": [str(x) for x in o.get("steps", [])][:5],
+                }
+            )
+    return options
+
+
+def food_thumb(url, size=44):
+    placeholder = ft.Container(
+        width=size,
+        height=size,
+        border_radius=10,
+        bgcolor="#f1f5f9",
+        content=ft.Row([ft.Text("🍽️", size=size * 0.5)], alignment=ft.MainAxisAlignment.CENTER),
+    )
+    if not url:
+        return placeholder
+    return ft.Image(
+        src=url,
+        width=size,
+        height=size,
+        fit=ft.BoxFit.COVER,
+        border_radius=10,
+        error_content=placeholder,
+    )
+
+
+# ==========================================
 # APLICACIÓN MÓVIL MULTIUSUARIO
 # ==========================================
 def main(page: ft.Page):
-    db = DatabaseManager()
+    db = DatabaseManager(os.getenv("DB_PATH", "gym_macros_mobile.db"))
 
     page.title = "GymMacro Pro"
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -1146,6 +1331,7 @@ def main(page: ft.Page):
             lbl_burned.value = f"{int(burned):,}".replace(",", ".")
 
             rem_kcal = max(0, int(tkcal - skcal))
+            suggest_btn.visible = rem_kcal >= 60
             lbl_remaining.value = f"{rem_kcal:,}".replace(",", ".")
             ring_main.value = min(1.0, skcal / max(1.0, tkcal))
 
@@ -1253,13 +1439,14 @@ def main(page: ft.Page):
                             )
                         )
                     else:
-                        for fid, _, fname, fgrams, fkcal, fp, fc_val, ff in m_foods:
+                        for fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg in m_foods:
                             meals_card_col.controls.append(
                                 ft.Container(
                                     bgcolor="#f8fafc",
                                     padding=10,
                                     content=ft.Row(
                                         [
+                                            food_thumb(fimg, 38),
                                             ft.Column(
                                                 [
                                                     ft.Text(
@@ -1293,6 +1480,27 @@ def main(page: ft.Page):
                                     ),
                                 )
                             )
+                        meals_card_col.controls.append(
+                            ft.Container(
+                                bgcolor="#f8fafc",
+                                padding=ft.Padding(left=10, right=10, top=0, bottom=10),
+                                content=make_button(
+                                    "⭐ Guardar como comida fija",
+                                    "#f59e0b",
+                                    lambda e, mn=m_name, mf=m_foods: save_fixed_dialog(
+                                        [
+                                            {
+                                                "name": x[2], "grams": x[3], "kcal": x[4],
+                                                "p": x[5], "c": x[6], "f": x[7], "image": x[8],
+                                            }
+                                            for x in mf
+                                        ],
+                                        f"{mn} habitual",
+                                        mn,
+                                    ),
+                                ),
+                            )
+                        )
 
                 if idx < len(meal_names) - 1:
                     meals_card_col.controls.append(
@@ -1320,6 +1528,13 @@ def main(page: ft.Page):
                     ),
                 ),
             ],
+        )
+
+        async def _go_sugg(e):
+            await go_suggestions(e)
+
+        suggest_btn = make_button(
+            "💡 ¿Qué como para llegar a mis calorías?", "#8b5cf6", _go_sugg
         )
 
         view_home = ft.Container(
@@ -1376,6 +1591,7 @@ def main(page: ft.Page):
                             spacing=8,
                         ),
                     ),
+                    suggest_btn,
                     ft.Container(
                         bgcolor="#ffffff",
                         border_radius=24,
@@ -1398,6 +1614,34 @@ def main(page: ft.Page):
             for m_name, meta in MEALS_META.items():
                 active = selected_meal_for_add[0] == m_name
                 meal_selector_row.controls.append(
+                    ft.Container(
+                        bgcolor="#1d8cf8" if active else "#ffffff",
+                        padding=10,
+                        border_radius=16,
+                        on_click=lambda e, mn=m_name: (
+                            selected_meal_for_add.__setitem__(0, mn),
+                            render_meal_selector_pills(),
+                            page.update(),
+                        ),
+                        content=ft.Text(
+                            f"{meta['icon']} {m_name}",
+                            size=12,
+                            weight="bold",
+                            color="white" if active else "#64748b",
+                        ),
+                    )
+                )
+
+        # Mismas pastillas de comida también en la pestaña IA
+        ai_meal_row = ft.Row(spacing=6, wrap=True)
+        _render_add_pills = render_meal_selector_pills
+
+        def render_meal_selector_pills():
+            _render_add_pills()
+            ai_meal_row.controls.clear()
+            for m_name, meta in MEALS_META.items():
+                active = selected_meal_for_add[0] == m_name
+                ai_meal_row.controls.append(
                     ft.Container(
                         bgcolor="#1d8cf8" if active else "#ffffff",
                         padding=10,
@@ -1469,7 +1713,27 @@ def main(page: ft.Page):
             expand=True,
         )
 
-        def fill_food_form(name, kcal, p, c, f):
+        current_food_image = [None]
+        food_preview = ft.Row(visible=False, alignment=ft.MainAxisAlignment.CENTER)
+
+        def set_food_image(url):
+            current_food_image[0] = url or None
+            if url:
+                food_preview.controls = [
+                    ft.Container(
+                        border_radius=18,
+                        shadow=CARD_SHADOW,
+                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                        content=food_thumb(url, 160),
+                    )
+                ]
+                food_preview.visible = True
+            else:
+                food_preview.controls = []
+                food_preview.visible = False
+
+        def fill_food_form(name, kcal, p, c, f, image=None):
+            set_food_image(image)
             tf_name.value = name
             tf_grams.value = "100"
             tf_kcal.value = str(round(float(kcal or 0), 1))
@@ -1556,7 +1820,8 @@ def main(page: ft.Page):
                 url = f"https://world.openfoodfacts.org/cgi/search.pl?search_terms={query}&search_simple=1&action=process&json=1&page_size=4"
                 resp = requests.get(url, headers=OFF_HEADERS, timeout=6).json()
                 for prod in resp.get("products", []):
-                    pname = prod.get("product_name", "Alimento")
+                    pname = prod.get("product_name") or "Alimento"
+                    img = prod.get("image_front_small_url") or prod.get("image_url")
                     nutr = prod.get("nutriments", {})
                     k = nutr.get("energy-kcal_100g", 0)
                     p = nutr.get("proteins_100g", 0)
@@ -1567,11 +1832,12 @@ def main(page: ft.Page):
                             bgcolor="#ffffff",
                             padding=12,
                             border_radius=14,
-                            on_click=lambda e, n=pname, k=k, p=p, c=c, f=f: fill_food_form(
-                                n, k, p, c, f
+                            on_click=lambda e, n=pname, k=k, p=p, c=c, f=f, im=img: fill_food_form(
+                                n, k, p, c, f, im
                             ),
                             content=ft.Row(
                                 [
+                                    food_thumb(img),
                                     ft.Column(
                                         [
                                             ft.Text(
@@ -1613,15 +1879,112 @@ def main(page: ft.Page):
                 f = float(tf_f.value) * factor
 
                 meal_dest = selected_meal_for_add[0]
-                db.add_food(current_user_id[0], meal_dest, name, grams, k, p, c, f)
+                db.add_food(current_user_id[0], meal_dest, name, grams, k, p, c, f, current_food_image[0])
                 for field in (tf_name, tf_kcal, tf_p, tf_c, tf_f):
                     field.value = ""
                 tf_grams.value = "100"
+                set_food_image(None)
                 expanded_meal[0] = meal_dest
                 notify(f"Añadido a {meal_dest}", "#10b981")
                 switch_tab(0)
             except ValueError:
                 notify("Rellena los gramos y macros con números", "#ef4444")
+
+        # ----- COMIDAS FIJAS -----
+        saved_col = ft.Column(spacing=8)
+
+        def add_items_to_log(items, meal_dest):
+            for it in items:
+                db.add_food(
+                    current_user_id[0], meal_dest, it["name"], it["grams"],
+                    it["kcal"], it["p"], it["c"], it["f"], it.get("image"),
+                )
+            expanded_meal[0] = meal_dest
+
+        def save_fixed_dialog(items, default_name="Mi comida", meal_type=None):
+            if not items:
+                notify("No hay alimentos que guardar", "#ef4444")
+                return
+            name_field = ft.TextField(label="Nombre", value=default_name, autofocus=True)
+
+            def do_save(e):
+                nm = (name_field.value or "").strip() or default_name
+                db.save_meal(current_user_id[0], nm, meal_type or selected_meal_for_add[0], items)
+                page.pop_dialog()
+                notify(f"⭐ '{nm}' guardada en comidas fijas", "#10b981")
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text("⭐ Guardar como comida fija"),
+                    content=name_field,
+                    actions=[
+                        ft.TextButton("Cancelar", on_click=lambda e: page.pop_dialog()),
+                        ft.TextButton("Guardar", on_click=do_save),
+                    ],
+                )
+            )
+
+        def use_saved_meal(sid):
+            for s_id, _, _, items in db.get_saved_meals(current_user_id[0]):
+                if s_id == sid:
+                    meal_dest = selected_meal_for_add[0]
+                    add_items_to_log(items, meal_dest)
+                    notify(f"Añadido a {meal_dest}", "#10b981")
+                    switch_tab(0)
+                    return
+
+        def delete_saved(sid):
+            db.delete_saved_meal(sid)
+            render_saved_meals()
+            page.update()
+
+        def render_saved_meals():
+            saved_col.controls.clear()
+            meals = db.get_saved_meals(current_user_id[0])
+            if not meals:
+                saved_col.controls.append(
+                    ft.Text(
+                        "Aún no tienes comidas fijas. Guárdalas con ⭐ desde 'Hoy' o desde la IA.",
+                        size=12, color="#94a3b8",
+                    )
+                )
+            for sid, sname, _, items in meals:
+                tk = sum(i["kcal"] for i in items)
+                tp_ = sum(i["p"] for i in items)
+                tc_ = sum(i["c"] for i in items)
+                tf_ = sum(i["f"] for i in items)
+                saved_col.controls.append(
+                    ft.Container(
+                        bgcolor="#ffffff", border_radius=16, padding=12, shadow=CARD_SHADOW,
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text(f"⭐ {sname}", size=14, weight="bold", color="#1e293b"),
+                                        ft.Text(
+                                            f"{int(tk)} kcal • P {int(tp_)}g • C {int(tc_)}g • G {int(tf_)}g",
+                                            size=11, color="#64748b",
+                                        ),
+                                        ft.Text(", ".join(i["name"] for i in items), size=11, color="#94a3b8"),
+                                    ],
+                                    spacing=2, expand=True,
+                                ),
+                                ft.Container(
+                                    padding=10, bgcolor="#1d8cf8", border_radius=12,
+                                    on_click=lambda e, s_=sid: use_saved_meal(s_),
+                                    content=ft.Text("➕", color="white", weight="bold"),
+                                ),
+                                ft.Container(
+                                    padding=8,
+                                    on_click=lambda e, s_=sid: delete_saved(s_),
+                                    content=ft.Text("🗑️", size=16),
+                                ),
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    )
+                )
 
         view_add = ft.Container(
             padding=18,
@@ -1644,11 +2007,231 @@ def main(page: ft.Page):
                     ),
                     search_results,
                     ft.Divider(color="#e2e8f0"),
+                    food_preview,
                     tf_name,
                     tf_grams,
                     ft.Row([tf_kcal, tf_p]),
                     ft.Row([tf_c, tf_f]),
                     make_button("➕ Registrar Alimento", "#1d8cf8", save_food_entry),
+                    ft.Divider(color="#e2e8f0"),
+                    ft.Text("⭐ Mis comidas fijas", size=18, weight="bold", color="#1e293b"),
+                    ft.Text("Toca ➕ para añadirlas a la comida seleccionada arriba.", size=12, color="#64748b"),
+                    saved_col,
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                spacing=10,
+            ),
+        )
+
+        # ----- CAPA IA: registrar por texto/voz + sugerencias -----
+        ai_state = {"items": []}
+        tf_ai = ft.TextField(
+            label="¿Qué has comido?",
+            hint_text="Ej: 2 rebanadas de pan integral, 50 g de pollo y 2 cucharadas de queso cottage",
+            multiline=True, min_lines=3, max_lines=6,
+            bgcolor="#ffffff", border_radius=14, border_color="#e2e8f0",
+        )
+        ai_loading_txt = ft.Text("Pensando…", size=13, color="#64748b")
+        ai_loading = ft.Row(
+            [ft.ProgressRing(width=18, height=18, stroke_width=3), ai_loading_txt],
+            visible=False,
+        )
+        ai_result_col = ft.Column(spacing=8)
+        ai_suggest_col = ft.Column(spacing=10)
+
+        def set_busy(flag, msg="Pensando…"):
+            ai_loading_txt.value = msg
+            ai_loading.visible = flag
+            page.update()
+
+        def macro_line(it):
+            return f"{int(it['kcal'])} kcal • P {it['p']:.1f}g • C {it['c']:.1f}g • G {it['f']:.1f}g"
+
+        def remove_ai_item(idx):
+            if 0 <= idx < len(ai_state["items"]):
+                ai_state["items"].pop(idx)
+            render_ai_items()
+            page.update()
+
+        def discard_ai(e=None):
+            ai_state["items"] = []
+            render_ai_items()
+            page.update()
+
+        def register_ai(e=None):
+            meal_dest = selected_meal_for_add[0]
+            add_items_to_log(ai_state["items"], meal_dest)
+            n = len(ai_state["items"])
+            ai_state["items"] = []
+            tf_ai.value = ""
+            render_ai_items()
+            notify(f"{n} alimento(s) añadidos a {meal_dest}", "#10b981")
+            switch_tab(0)
+
+        def render_ai_items():
+            ai_result_col.controls.clear()
+            items = ai_state["items"]
+            if not items:
+                return
+            for idx, it in enumerate(items):
+                ai_result_col.controls.append(
+                    ft.Container(
+                        bgcolor="#ffffff", border_radius=14, padding=12, shadow=CARD_SHADOW,
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text(f"{it['name']} (~{int(it['grams'])} g)", size=14, weight="bold", color="#1e293b"),
+                                        ft.Text(macro_line(it), size=11, color="#64748b"),
+                                    ],
+                                    spacing=2, expand=True,
+                                ),
+                                ft.Container(
+                                    padding=6,
+                                    on_click=lambda e, i=idx: remove_ai_item(i),
+                                    content=ft.Text("✕", color="#ef4444", weight="bold"),
+                                ),
+                            ]
+                        ),
+                    )
+                )
+            tot = {k: sum(i[k] for i in items) for k in ("kcal", "p", "c", "f")}
+            ai_result_col.controls.append(
+                ft.Container(
+                    bgcolor="#1e293b", border_radius=14, padding=12,
+                    content=ft.Text(f"TOTAL: {macro_line(tot)}", size=12, weight="bold", color="white"),
+                )
+            )
+            ai_result_col.controls.append(
+                make_button(f"✅ Registrar en {selected_meal_for_add[0]}", "#10b981", register_ai)
+            )
+            ai_result_col.controls.append(
+                make_button(
+                    "⭐ Guardar como comida fija", "#f59e0b",
+                    lambda e: save_fixed_dialog(list(ai_state["items"]), "Mi comida habitual"),
+                )
+            )
+            ai_result_col.controls.append(
+                make_button("Descartar", "#e2e8f0", discard_ai, text_color="#334155")
+            )
+
+        async def analyze_text(e=None):
+            text = (tf_ai.value or "").strip()
+            if not text:
+                notify("Escribe o dicta lo que has comido", "#ef4444")
+                return
+            set_busy(True, "Calculando pesos y macros…")
+            try:
+                ai_state["items"] = await asyncio.to_thread(ai_parse_foods, text)
+            except Exception as ex:
+                set_busy(False)
+                notify(f"IA: {ex}", "#ef4444")
+                return
+            render_ai_items()
+            set_busy(False)
+
+        def today_remaining():
+            u = db.get_user(current_user_id[0])
+            foods = db.get_today_foods(current_user_id[0])
+            rem = {
+                "kcal": u[10] - sum(x[4] for x in foods),
+                "p": max(0, u[11] - sum(x[5] for x in foods)),
+                "c": max(0, u[12] - sum(x[6] for x in foods)),
+                "f": max(0, u[13] - sum(x[7] for x in foods)),
+            }
+            return rem, [x[2] for x in foods]
+
+        def add_suggestion(o):
+            meal_dest = selected_meal_for_add[0]
+            add_items_to_log(
+                [{"name": o["title"], "grams": o["grams"], "kcal": o["kcal"], "p": o["p"], "c": o["c"], "f": o["f"]}],
+                meal_dest,
+            )
+            notify(f"Añadido a {meal_dest}", "#10b981")
+            switch_tab(0)
+
+        def render_suggestions(options, rem_kcal):
+            ai_suggest_col.controls.clear()
+            if not options:
+                ai_suggest_col.controls.append(
+                    ft.Text("La IA no encontró opciones que encajen sin pasarte. Inténtalo de nuevo.", size=12, color="#64748b")
+                )
+                return
+            ai_suggest_col.controls.append(
+                ft.Text(f"Te quedan {int(rem_kcal)} kcal. Todas estas opciones caben sin pasarte:", size=12, color="#64748b")
+            )
+            for o in options:
+                steps = "\n".join(f"{i + 1}. {st}" for i, st in enumerate(o["steps"]))
+                ai_suggest_col.controls.append(
+                    ft.Container(
+                        bgcolor="#ffffff", border_radius=18, padding=14, shadow=CARD_SHADOW,
+                        content=ft.Column(
+                            [
+                                ft.Text(o["title"], size=15, weight="bold", color="#1e293b"),
+                                ft.Text(o["description"], size=12, color="#64748b"),
+                                ft.Text(macro_line(o), size=12, weight="bold", color="#1d8cf8"),
+                                ft.Text("🛒 " + ", ".join(o["ingredients"]), size=11, color="#334155") if o["ingredients"] else ft.Container(),
+                                ft.Text(steps, size=11, color="#475569") if steps else ft.Container(),
+                                ft.Row(
+                                    [
+                                        make_button("➕ Registrar", "#10b981", lambda e, oo=o: add_suggestion(oo), expand=True),
+                                        make_button(
+                                            "⭐ Guardar", "#f59e0b",
+                                            lambda e, oo=o: save_fixed_dialog(
+                                                [{"name": oo["title"], "grams": oo["grams"], "kcal": oo["kcal"], "p": oo["p"], "c": oo["c"], "f": oo["f"]}],
+                                                oo["title"],
+                                            ),
+                                            expand=True,
+                                        ),
+                                    ],
+                                    spacing=8,
+                                ),
+                            ],
+                            spacing=6,
+                        ),
+                    )
+                )
+
+        async def run_suggestions(e=None):
+            rem, eaten = today_remaining()
+            if rem["kcal"] < 60:
+                ai_suggest_col.controls = [ft.Text("🎉 ¡Ya has llegado a tus calorías de hoy!", size=13, color="#10b981", weight="bold")]
+                page.update()
+                return
+            set_busy(True, "Buscando opciones para ti…")
+            try:
+                options = await asyncio.to_thread(ai_suggest, rem, eaten, selected_meal_for_add[0])
+            except Exception as ex:
+                set_busy(False)
+                notify(f"IA: {ex}", "#ef4444")
+                return
+            render_suggestions(options, rem["kcal"])
+            set_busy(False)
+
+        async def go_suggestions(e=None):
+            switch_tab(2)
+            await run_suggestions()
+
+        view_ai = ft.Container(
+            padding=18,
+            expand=True,
+            content=ft.Column(
+                [
+                    ft.Text("Asistente IA 🤖", size=24, weight="bold", color="#1e293b"),
+                    ft.Text("Cuéntame qué has comido y yo calculo pesos y macros.", size=13, color="#64748b"),
+                    ft.Text("Se registrará en:", size=12, weight="bold", color="#64748b"),
+                    ai_meal_row,
+                    tf_ai,
+                    ft.Text("🎤 Para dictar, pulsa el micrófono de tu teclado.", size=11, color="#94a3b8"),
+                    make_button("✨ Calcular macros", "#8b5cf6", analyze_text),
+                    ai_loading,
+                    ai_result_col,
+                    ft.Divider(color="#e2e8f0"),
+                    ft.Text("💡 Completar mi día", size=18, weight="bold", color="#1e293b"),
+                    ft.Text("Si te faltan calorías, te propongo opciones y recetas sin pasarte.", size=12, color="#64748b"),
+                    make_button("Ver opciones para llegar", "#1d8cf8", run_suggestions),
+                    ai_suggest_col,
                 ],
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -1688,7 +2271,7 @@ def main(page: ft.Page):
                     resp = requests.get(url, headers=OFF_HEADERS, timeout=6).json()
                     if resp.get("status") == 1:
                         prod = resp["product"]
-                        name = prod.get("product_name", "Producto Escaneado")
+                        name = prod.get("product_name") or "Producto Escaneado"
                         nutr = prod.get("nutriments", {})
                         fill_food_form(
                             name,
@@ -1696,6 +2279,7 @@ def main(page: ft.Page):
                             nutr.get("proteins_100g", 0),
                             nutr.get("carbohydrates_100g", 0),
                             nutr.get("fat_100g", 0),
+                            prod.get("image_front_url") or prod.get("image_url"),
                         )
                         return
                     else:
@@ -1958,7 +2542,7 @@ def main(page: ft.Page):
         # ----- NAVEGACIÓN INFERIOR -----
         nav_index = [0]
         content_area = ft.Container(expand=True)
-        views_list = [view_home, view_add, view_scan, view_profile]
+        views_list = [view_home, view_add, view_ai, view_scan, view_profile]
         nav_buttons = []
 
         def switch_tab(index):
@@ -1968,14 +2552,18 @@ def main(page: ft.Page):
                 active = nav_index[0] == i
                 btn.content.controls[0].color = "#1d8cf8" if active else "#94a3b8"
                 btn.content.controls[1].color = "#1d8cf8" if active else "#94a3b8"
+            if index != 3 and scan_state["active"]:
+                close_camera_inline()
             if index == 0:
                 refresh_dashboard()
-            elif index == 3:
+            elif index == 1:
+                render_saved_meals()
+            elif index == 4:
                 refresh_profile_tab()
             page.update()
 
         for i, (icon, label) in enumerate(
-            [("🏠", "Hoy"), ("➕", "Añadir"), ("📷", "Escáner"), ("👤", "Perfil")]
+            [("🏠", "Hoy"), ("➕", "Añadir"), ("🤖", "IA"), ("📷", "Escáner"), ("👤", "Perfil")]
         ):
             nav_buttons.append(
                 ft.Container(
