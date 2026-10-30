@@ -11,6 +11,38 @@ import numpy as np
 import flet as ft
 import flet_camera as fc
 import requests
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+
+    APP_TZ = ZoneInfo(os.getenv("APP_TZ", "Europe/Madrid"))
+except Exception:  # sin base de zonas horarias: se usa la hora local del equipo
+    APP_TZ = None
+
+DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
+DIA_INICIAL = ["L", "M", "X", "J", "V", "S", "D"]
+
+
+def now_local():
+    """Hora actual en la zona del usuario (por defecto Europe/Madrid; cámbiala con APP_TZ)."""
+    return datetime.now(APP_TZ) if APP_TZ else datetime.now()
+
+
+def today_str():
+    return now_local().strftime("%Y-%m-%d")
+
+
+def date_es_long(d):
+    return f"{DIAS_ES[d.weekday()].capitalize()}, {d.day} de {MESES_ES[d.month - 1]} de {d.year}"
+
+
+def date_es_short(d):
+    return f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1][:3]}"
 
 
 # ==========================================
@@ -238,10 +270,10 @@ class DatabaseManager:
     def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None):
         self.cursor.execute(
             """
-            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image, date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (user_id, meal_type, name, grams, kcal, p, c, f, image),
+            (user_id, meal_type, name, grams, kcal, p, c, f, image, today_str()),
         )
         self.conn.commit()
 
@@ -250,9 +282,22 @@ class DatabaseManager:
             """
             SELECT id, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image
             FROM food_log
-            WHERE user_id = ? AND date = DATE('now', 'localtime')
+            WHERE user_id = ? AND date = ?
         """,
-            (user_id,),
+            (user_id, today_str()),
+        )
+        return self.cursor.fetchall()
+
+    def get_foods_between(self, user_id, start, end):
+        """Alimentos entre dos fechas (YYYY-MM-DD, ambas incluidas)."""
+        self.cursor.execute(
+            """
+            SELECT id, date, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image
+            FROM food_log
+            WHERE user_id = ? AND date BETWEEN ? AND ?
+            ORDER BY date ASC, id ASC
+        """,
+            (user_id, start, end),
         )
         return self.cursor.fetchall()
 
@@ -885,6 +930,7 @@ def main(page: ft.Page):
 
     # Estado global de sesión
     current_user_id = [None]
+    on_new_day = [None]  # callback que se ejecuta cuando cambia el día (00:00)
     selected_meal_for_add = ["Desayuno"]
     expanded_meal = [None]
 
@@ -941,6 +987,7 @@ def main(page: ft.Page):
     # PANTALLA A: SELECTOR DE PERFILES (MULTIUSUARIO)
     # ==========================================
     def show_user_selector(e=None):
+        on_new_day[0] = None
         users = db.get_all_users()
         if not users:
             # Si no hay usuarios creados, abrimos directamente el asistente dinámico
@@ -1942,6 +1989,7 @@ def main(page: ft.Page):
             _, uname, uavatar, _, _, _, _, _, _, _, tkcal, tp, tc, tf, burned = u
             header_user_txt.value = uname
             header_avatar_txt.value = (uname[:1] or "?").upper()
+            lbl_date.value = date_es_long(now_local().date())
 
             foods = db.get_today_foods(current_user_id[0])
 
@@ -2129,11 +2177,22 @@ def main(page: ft.Page):
             "💡 Plan de recetas para llegar a mis calorías", "#1C1B18", _go_sugg
         )
 
+        lbl_date = ft.Text(
+            date_es_long(now_local().date()), size=14, weight=ft.FontWeight.W_600, color="#3A3832"
+        )
+
         view_home = ft.Container(
             padding=16,
             expand=True,
             content=ft.Column(
                 [
+                    ft.Row(
+                        [
+                            ft.Icon(ft.Icons.CALENDAR_TODAY_OUTLINED, size=16, color="#24543F"),
+                            lbl_date,
+                        ],
+                        spacing=8,
+                    ),
                     ft.Container(
                         bgcolor="#ffffff",
                         border_radius=14,
@@ -3316,10 +3375,181 @@ def main(page: ft.Page):
             ),
         )
 
+        # ----- CAPA: HISTORIAL (ÚLTIMOS 7 DÍAS) -----
+        history_open = [None]  # fecha (YYYY-MM-DD) del día desplegado
+        history_chart = ft.Row(alignment=ft.MainAxisAlignment.SPACE_AROUND, vertical_alignment=ft.CrossAxisAlignment.END)
+        history_summary = ft.Text("", size=13, color="#3A3832")
+        history_col = ft.Column(spacing=10)
+
+        def toggle_history_day(day_iso):
+            history_open[0] = None if history_open[0] == day_iso else day_iso
+            refresh_history()
+
+        def refresh_history():
+            u = db.get_user(current_user_id[0])
+            if not u:
+                return
+            tkcal = max(1.0, float(u[10]))
+            today = now_local().date()
+            days = [today - timedelta(days=i) for i in range(6, -1, -1)]  # de más antiguo a hoy
+            rows = db.get_foods_between(current_user_id[0], days[0].isoformat(), today.isoformat())
+            by_day = {}
+            for r in rows:
+                by_day.setdefault(r[1], []).append(r)
+
+            def tot(day_iso):
+                fs = by_day.get(day_iso, [])
+                return (sum(x[5] for x in fs), sum(x[6] for x in fs), sum(x[7] for x in fs), sum(x[8] for x in fs))
+
+            # Gráfico de barras: kcal por día respecto a tu objetivo
+            history_chart.controls = []
+            for d in days:
+                k = tot(d.isoformat())[0]
+                h = 4 if k <= 0 else max(8, int(70 * min(1.3, k / tkcal)))
+                color = "#E4DFD3" if k <= 0 else ("#3F7D58" if k <= tkcal * 1.05 else "#C9763F")
+                history_chart.controls.append(
+                    ft.Column(
+                        [
+                            ft.Container(width=22, height=h, bgcolor=color, border_radius=5),
+                            ft.Text(
+                                DIA_INICIAL[d.weekday()], size=12,
+                                weight=ft.FontWeight.W_600 if d == today else ft.FontWeight.NORMAL,
+                                color="#24543F" if d == today else "#77736A",
+                            ),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        spacing=4,
+                    )
+                )
+
+            logged = [d for d in days if by_day.get(d.isoformat())]
+            if logged:
+                n = len(logged)
+                sk = sum(tot(d.isoformat())[0] for d in logged) / n
+                sp = sum(tot(d.isoformat())[1] for d in logged) / n
+                sc = sum(tot(d.isoformat())[2] for d in logged) / n
+                sf = sum(tot(d.isoformat())[3] for d in logged) / n
+                history_summary.value = (
+                    f"Media de {n} {'día' if n == 1 else 'días'} con registro: {int(sk)} kcal • "
+                    f"P {int(sp)}g • C {int(sc)}g • G {int(sf)}g"
+                )
+            else:
+                history_summary.value = "Aún no hay registros en los últimos 7 días."
+
+            # Tarjetas por día (hoy primero)
+            history_col.controls = []
+            for d in reversed(days):
+                iso = d.isoformat()
+                k, p_, c_, f_ = tot(iso)
+                if d == today:
+                    label = "Hoy"
+                elif d == today - timedelta(days=1):
+                    label = "Ayer"
+                else:
+                    label = date_es_short(d).capitalize()
+                is_open = history_open[0] == iso
+                has = bool(by_day.get(iso))
+                header = ft.Container(
+                    padding=14,
+                    on_click=(lambda e, i=iso: toggle_history_day(i)) if has else None,
+                    content=ft.Row(
+                        [
+                            ft.Column(
+                                [
+                                    ft.Text(label, size=15, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                    ft.Text(
+                                        f"P {int(p_)}g • C {int(c_)}g • G {int(f_)}g" if has else "Sin registros",
+                                        size=12, color="#77736A",
+                                    ),
+                                ],
+                                spacing=2, expand=True,
+                            ),
+                            ft.Text(
+                                f"{int(k)} / {int(tkcal)} kcal" if has else "—",
+                                size=13, weight=ft.FontWeight.W_600, color="#24543F",
+                            ),
+                            ft.Icon(
+                                ft.Icons.EXPAND_LESS if is_open else ft.Icons.EXPAND_MORE,
+                                size=20, color="#A9A59B", visible=has,
+                            ),
+                        ],
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                )
+                card_items = [header]
+                if is_open and has:
+                    order = list(MEALS_META.keys())
+                    for r in by_day[iso]:
+                        if r[2] not in order:
+                            order.append(r[2])
+                    for m_name in order:
+                        m_foods = [r for r in by_day[iso] if r[2] == m_name]
+                        if not m_foods:
+                            continue
+                        card_items.append(
+                            ft.Container(
+                                bgcolor="#FAF8F4",
+                                padding=ft.Padding(left=14, right=14, top=8, bottom=8),
+                                content=ft.Column(
+                                    [
+                                        ft.Text(
+                                            f"{m_name} • {int(sum(x[5] for x in m_foods))} kcal",
+                                            size=12, weight=ft.FontWeight.W_600, color="#24543F",
+                                        ),
+                                        *[
+                                            ft.Text(
+                                                f"• {x[3]} ({int(x[4])}g) — {int(x[5])} kcal",
+                                                size=12, color="#3A3832",
+                                            )
+                                            for x in m_foods
+                                        ],
+                                    ],
+                                    spacing=3,
+                                ),
+                            )
+                        )
+                history_col.controls.append(
+                    ft.Container(
+                        bgcolor="#ffffff", border_radius=12, border=CARD_BORDER,
+                        clip_behavior=ft.ClipBehavior.HARD_EDGE,
+                        content=ft.Column(card_items, spacing=0),
+                    )
+                )
+            page.update()
+
+        view_history = ft.Container(
+            padding=18,
+            expand=True,
+            content=ft.Column(
+                [
+                    ft.Text("Últimos 7 días", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    ft.Container(
+                        bgcolor="#ffffff", padding=16, border_radius=14, border=CARD_BORDER,
+                        content=ft.Column(
+                            [
+                                history_chart,
+                                ft.Text(
+                                    "Verde: dentro de tu objetivo • Naranja: te pasaste",
+                                    size=11, color="#A9A59B", text_align=ft.TextAlign.CENTER,
+                                ),
+                            ],
+                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                            spacing=8,
+                        ),
+                    ),
+                    history_summary,
+                    history_col,
+                ],
+                scroll=ft.ScrollMode.AUTO,
+                expand=True,
+                spacing=12,
+            ),
+        )
+
         # ----- NAVEGACIÓN INFERIOR -----
         nav_index = [0]
         content_area = ft.Container(expand=True)
-        views_list = [view_home, view_add, view_ai, view_scan, view_profile]
+        views_list = [view_home, view_add, view_ai, view_scan, view_history, view_profile]
         nav_bar = ft.NavigationBar(
             selected_index=0,
             bgcolor="#FFFFFF",
@@ -3334,6 +3564,7 @@ def main(page: ft.Page):
                 ft.NavigationBarDestination(icon=ft.Icons.ADD_CIRCLE_OUTLINE, selected_icon=ft.Icons.ADD_CIRCLE, label="Añadir"),
                 ft.NavigationBarDestination(icon=ft.Icons.AUTO_AWESOME_OUTLINED, selected_icon=ft.Icons.AUTO_AWESOME, label="IA"),
                 ft.NavigationBarDestination(icon=ft.Icons.QR_CODE_SCANNER, selected_icon=ft.Icons.QR_CODE_SCANNER, label="Escáner"),
+                ft.NavigationBarDestination(icon=ft.Icons.HISTORY, selected_icon=ft.Icons.HISTORY, label="Historial"),
                 ft.NavigationBarDestination(icon=ft.Icons.PERSON_OUTLINE, selected_icon=ft.Icons.PERSON, label="Perfil"),
             ],
         )
@@ -3349,6 +3580,8 @@ def main(page: ft.Page):
             elif index == 1:
                 render_saved_meals()
             elif index == 4:
+                refresh_history()
+            elif index == 5:
                 refresh_profile_tab()
             page.update()
 
@@ -3357,12 +3590,43 @@ def main(page: ft.Page):
             spacing=0,
             expand=True,
         )
+
+        def _new_day():
+            """Se ejecuta a las 00:00: nuevo día, contadores a cero y fecha actualizada."""
+            if current_user_id[0] is None:
+                return
+            expanded_meal[0] = None
+            history_open[0] = None
+            refresh_dashboard()
+            if nav_index[0] == 4:
+                refresh_history()
+            notify(f"Nuevo día: {date_es_short(now_local().date())}", "#24543F")
+
+        on_new_day[0] = _new_day
         switch_tab(0)
 
     # ==========================================
     # MONTAJE INICIAL
     # ==========================================
+    async def day_watcher():
+        """Despierta justo después de las 00:00 y avisa a la pantalla abierta."""
+        last = today_str()
+        while True:
+            now = now_local()
+            nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
+            await asyncio.sleep(min(30.0, max(1.0, (nxt - now).total_seconds())))
+            cur = today_str()
+            if cur != last:
+                last = cur
+                cb = on_new_day[0]
+                if cb:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+
     page.add(status_banner, root_container)
+    page.run_task(day_watcher)
     show_user_selector()
 
 
