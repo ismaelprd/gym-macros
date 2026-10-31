@@ -289,6 +289,34 @@ class DatabaseManager:
         )
         return self.cursor.fetchall()
 
+    def get_recent_foods(self, user_id, limit=10):
+        """Últimos alimentos distintos añadidos, con sus valores por 100 g y los gramos usados."""
+        self.cursor.execute(
+            """
+            SELECT name, grams, kcal, p, c, f, image
+            FROM food_log
+            WHERE id IN (
+                SELECT MAX(id) FROM food_log WHERE user_id = ? GROUP BY LOWER(name)
+            )
+            ORDER BY id DESC
+            LIMIT ?
+        """,
+            (user_id, limit),
+        )
+        out = []
+        for name, grams, kcal, p, c, f, image in self.cursor.fetchall():
+            g = float(grams or 0)
+            if g <= 0:
+                continue
+            k100 = 100.0 / g
+            out.append(
+                {
+                    "name": name, "grams": g, "image": image,
+                    "kcal": kcal * k100, "p": p * k100, "c": c * k100, "f": f * k100,
+                }
+            )
+        return out
+
     def get_foods_between(self, user_id, start, end):
         """Alimentos entre dos fechas (YYYY-MM-DD, ambas incluidas)."""
         self.cursor.execute(
@@ -856,16 +884,19 @@ def _scaled(img, s):
     return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_CUBIC)
 
 
-def _barcode_variants(img):
+def _barcode_variants(img, deep=True):
     """Versiones de un fotograma (de la más probable a la más costosa) para facilitar la lectura.
 
     El detector de OpenCV solo lee códigos cuyo ancho ronda los 150-300 px, así que se prueba
-    una pirámide de escalas: reducida si el código está muy cerca, ampliada si está lejos.
+    una pirámide de escalas. En modo rápido (deep=False) solo las tres escalas más habituales;
+    el modo profundo añade recortes ampliados, realce de contraste/nitidez y giro de 90°.
     """
     h, w = img.shape[:2]
-    center = img[int(h * 0.2) : int(h * 0.8), int(w * 0.1) : int(w * 0.9)]  # el código suele ir centrado
-    for sc in (1.0, 0.5, 0.35, 0.7, 0.25, 0.18):  # código grande/cerca
+    for sc in (1.0, 0.5, 0.7) if not deep else (1.0, 0.5, 0.35, 0.7, 0.25, 0.18):
         yield _scaled(img, sc)
+    if not deep:
+        return
+    center = img[int(h * 0.2) : int(h * 0.8), int(w * 0.1) : int(w * 0.9)]  # el código suele ir centrado
     for sc in (1.5, 2.0):  # código pequeño/lejos
         yield _scaled(center, sc)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -880,18 +911,19 @@ def _barcode_variants(img):
         yield _scaled(rot, sc)
 
 
-def decode_frame(image_bytes):
-    """Texto de un QR o de un código de barras VÁLIDO (con dígito de control), o '' si no hay."""
+def decode_frame(image_bytes, deep=True, max_side=1280):
+    """Texto de un QR o de un código de barras VÁLIDO (con dígito de control), o '' si no hay.
+
+    deep=False es la pasada rápida del escaneo automático (se alterna con pasadas profundas);
+    el botón Capturar usa deep=True y una resolución mayor.
+    """
     img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         return ""
-    try:
-        data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
-        if data:
-            return data
-    except Exception:
-        pass
-    if _pyzbar is not None:
+    big = max(img.shape[:2])
+    if big > max_side:  # los fotogramas de 4000 px hacían lentísima cada pasada
+        img = _scaled(img, max_side / float(big))
+    if _pyzbar is not None:  # el más rápido con EAN/UPC: se prueba primero
         try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             for b in _pyzbar.decode(gray):
@@ -900,13 +932,19 @@ def decode_frame(image_bytes):
                     return txt
         except Exception:
             pass
+    try:
+        data, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+        if data:
+            return data
+    except Exception:
+        pass
     if hasattr(cv2, "barcode"):
         try:
             det = cv2.barcode.BarcodeDetector()
         except Exception:
             det = None
         if det is not None:
-            for variant in _barcode_variants(img):
+            for variant in _barcode_variants(img, deep):
                 for code in _cv_barcode_read(det, variant):
                     if valid_ean(code):
                         return code
@@ -926,6 +964,302 @@ def off_nutri(nutr):
         _num(nutr.get("carbohydrates_100g")),
         _num(nutr.get("fat_100g")),
     )
+
+
+# Alimentos básicos (por 100 g): (nombre, kcal, proteína, carbohidratos, grasa, sinónimos)
+# Valores medios orientativos (tablas BEDCA/USDA); los cocidos van marcados como tales.
+BASIC_FOODS = [
+    # ---- Frutas ----
+    ("Mandarina", 53, 0.8, 13.3, 0.3, "clementina satsuma mandarinas"),
+    ("Naranja", 47, 0.9, 11.8, 0.1, "naranjas"),
+    ("Limón", 29, 1.1, 9.3, 0.3, "limon limones"),
+    ("Pomelo", 42, 0.8, 10.7, 0.1, ""),
+    ("Manzana", 52, 0.3, 13.8, 0.2, "manzanas"),
+    ("Pera", 57, 0.4, 15.2, 0.1, "peras"),
+    ("Plátano", 89, 1.1, 22.8, 0.3, "platano banana bananas"),
+    ("Uvas", 69, 0.7, 18.1, 0.2, "uva"),
+    ("Fresas", 32, 0.7, 7.7, 0.3, "fresa freson"),
+    ("Arándanos", 57, 0.7, 14.5, 0.3, "arandanos arandano"),
+    ("Frambuesas", 52, 1.2, 11.9, 0.7, "frambuesa"),
+    ("Melocotón", 39, 0.9, 9.5, 0.3, "melocoton durazno"),
+    ("Nectarina", 44, 1.1, 10.6, 0.3, "paraguayo"),
+    ("Albaricoque", 48, 1.4, 11.1, 0.4, "damasco"),
+    ("Ciruela", 46, 0.7, 11.4, 0.3, "ciruelas"),
+    ("Cerezas", 63, 1.1, 16.0, 0.2, "cereza"),
+    ("Kiwi", 61, 1.1, 14.7, 0.5, ""),
+    ("Piña", 50, 0.5, 13.1, 0.1, "pina ananas"),
+    ("Mango", 60, 0.8, 15.0, 0.4, ""),
+    ("Sandía", 30, 0.6, 7.6, 0.2, "sandia"),
+    ("Melón", 34, 0.8, 8.2, 0.2, "melon"),
+    ("Papaya", 43, 0.5, 10.8, 0.3, ""),
+    ("Aguacate", 160, 2.0, 8.5, 14.7, "palta"),
+    ("Granada", 83, 1.7, 18.7, 1.2, ""),
+    ("Higos", 74, 0.8, 19.2, 0.3, "higo"),
+    ("Dátiles", 282, 2.5, 75.0, 0.4, "datiles datil"),
+    ("Pasas", 299, 3.1, 79.2, 0.5, "uvas pasas"),
+    # ---- Verduras y hortalizas ----
+    ("Tomate", 18, 0.9, 3.9, 0.2, "tomates"),
+    ("Lechuga", 15, 1.4, 2.9, 0.2, "ensalada"),
+    ("Espinacas", 23, 2.9, 3.6, 0.4, "espinaca"),
+    ("Brócoli", 34, 2.8, 6.6, 0.4, "brocoli"),
+    ("Coliflor", 25, 1.9, 5.0, 0.3, ""),
+    ("Zanahoria", 41, 0.9, 9.6, 0.2, "zanahorias"),
+    ("Pepino", 15, 0.7, 3.6, 0.1, ""),
+    ("Pimiento rojo", 31, 1.0, 6.0, 0.3, "pimiento"),
+    ("Pimiento verde", 20, 0.9, 4.6, 0.2, "pimiento"),
+    ("Cebolla", 40, 1.1, 9.3, 0.1, ""),
+    ("Ajo", 149, 6.4, 33.0, 0.5, ""),
+    ("Calabacín", 17, 1.2, 3.1, 0.3, "calabacin"),
+    ("Berenjena", 25, 1.0, 5.9, 0.2, ""),
+    ("Champiñones", 22, 3.1, 3.3, 0.3, "champinones setas hongos"),
+    ("Judías verdes", 31, 1.8, 7.0, 0.2, "judias verdes ejotes"),
+    ("Espárragos", 20, 2.2, 3.9, 0.1, "esparragos"),
+    ("Alcachofa", 47, 3.3, 10.5, 0.2, "alcachofas"),
+    ("Puerro", 61, 1.5, 14.2, 0.3, ""),
+    ("Calabaza", 26, 1.0, 6.5, 0.1, ""),
+    ("Remolacha", 43, 1.6, 9.6, 0.2, "betabel"),
+    ("Repollo", 25, 1.3, 5.8, 0.1, "col"),
+    ("Coles de Bruselas", 43, 3.4, 9.0, 0.3, "col de bruselas"),
+    ("Apio", 16, 0.7, 3.0, 0.2, ""),
+    ("Maíz dulce", 86, 3.3, 19.0, 1.4, "maiz"),
+    ("Guisantes", 81, 5.4, 14.5, 0.4, "chicharos arvejas"),
+    ("Patata cocida", 87, 1.9, 20.1, 0.1, "papa patatas cocidas"),
+    ("Patata cruda", 77, 2.0, 17.5, 0.1, "papa patatas"),
+    ("Boniato", 86, 1.6, 20.1, 0.1, "batata camote"),
+    ("Tomate triturado", 24, 1.3, 4.2, 0.2, "salsa de tomate"),
+    ("Aceitunas", 145, 1.0, 3.8, 15.3, "aceituna olivas"),
+    # ---- Cereales, pan y pasta ----
+    ("Arroz blanco (cocido)", 130, 2.7, 28.0, 0.3, "arroz"),
+    ("Arroz blanco (crudo)", 350, 7.0, 78.0, 1.0, "arroz"),
+    ("Arroz integral (cocido)", 112, 2.3, 23.5, 0.8, "arroz"),
+    ("Pasta (cocida)", 158, 5.8, 30.9, 0.9, "macarrones espaguetis fideos tallarines"),
+    ("Pasta (cruda)", 359, 12.5, 74.0, 1.5, "macarrones espaguetis fideos tallarines"),
+    ("Pan blanco", 265, 9.0, 49.0, 3.2, "barra pan"),
+    ("Pan integral", 247, 13.0, 41.0, 3.4, "pan"),
+    ("Pan de molde", 265, 8.0, 49.0, 3.0, "pan bimbo"),
+    ("Copos de Avena", 389, 16.9, 66.3, 6.9, "avena"),
+    ("Cuscús (cocido)", 112, 3.8, 23.2, 0.2, "cuscus"),
+    ("Quinoa (cocida)", 120, 4.4, 21.3, 1.9, ""),
+    ("Harina de trigo", 364, 10.0, 76.0, 1.0, ""),
+    ("Cereales de desayuno", 357, 7.5, 84.0, 0.4, "corn flakes cereales"),
+    ("Galletas María", 430, 7.0, 75.0, 11.0, "galletas"),
+    ("Tortilla de trigo (wrap)", 310, 8.0, 52.0, 7.0, "wrap tortita"),
+    ("Tortitas de arroz", 387, 8.0, 82.0, 2.8, ""),
+    ("Palomitas", 387, 13.0, 78.0, 4.5, ""),
+    # ---- Legumbres y vegetales proteicos ----
+    ("Lentejas (cocidas)", 116, 9.0, 20.0, 0.4, "lenteja"),
+    ("Garbanzos (cocidos)", 164, 8.9, 27.4, 2.6, "garbanzo"),
+    ("Alubias (cocidas)", 127, 8.7, 22.8, 0.5, "judias frijoles habichuelas"),
+    ("Hummus", 166, 8.0, 14.3, 9.6, "humus"),
+    ("Tofu", 76, 8.0, 1.9, 4.8, ""),
+    ("Tempeh", 192, 20.0, 7.6, 11.0, ""),
+    ("Seitán", 120, 25.0, 4.0, 1.9, "seitan"),
+    # ---- Carnes y embutidos ----
+    ("Pechuga de Pollo", 105, 23.0, 0.0, 1.2, "pollo"),
+    ("Muslo de Pollo", 177, 20.0, 0.0, 10.5, "pollo"),
+    ("Pechuga de Pavo", 104, 24.0, 0.0, 1.0, "pavo"),
+    ("Ternera magra", 143, 21.4, 0.0, 6.0, "ternera filete vacuno carne"),
+    ("Carne picada", 215, 18.0, 0.0, 15.0, "picada ternera hamburguesa"),
+    ("Lomo de cerdo", 143, 21.0, 0.0, 6.0, "cerdo"),
+    ("Cordero (pierna)", 190, 20.0, 0.0, 12.0, ""),
+    ("Conejo", 136, 20.0, 0.0, 5.5, ""),
+    ("Jamón serrano", 241, 31.0, 0.0, 13.0, "jamon"),
+    ("Jamón cocido", 126, 19.0, 1.0, 5.0, "jamon york"),
+    ("Chorizo", 455, 24.0, 2.0, 38.0, ""),
+    ("Bacon", 417, 12.6, 1.4, 40.0, "beicon"),
+    ("Salchichas", 290, 11.0, 3.0, 26.0, "salchicha frankfurt"),
+    # ---- Pescados y mariscos ----
+    ("Salmón", 208, 20.0, 0.0, 13.0, "salmon"),
+    ("Atún al Natural", 103, 24.0, 0.0, 1.0, "atun lata"),
+    ("Atún en Aceite", 190, 22.0, 0.0, 11.0, "atun lata"),
+    ("Atún fresco", 144, 23.0, 0.0, 4.9, "atun"),
+    ("Merluza", 82, 17.8, 0.0, 0.9, "pescado blanco"),
+    ("Bacalao", 82, 18.0, 0.0, 0.7, "pescado blanco"),
+    ("Lubina", 97, 18.0, 0.0, 2.0, "pescado"),
+    ("Dorada", 100, 19.0, 0.0, 2.5, "pescado"),
+    ("Trucha", 119, 20.0, 0.0, 3.5, "pescado"),
+    ("Caballa", 205, 19.0, 0.0, 14.0, "pescado"),
+    ("Sardinas en aceite", 208, 24.6, 0.0, 11.5, "sardina lata"),
+    ("Anchoas en aceite", 210, 29.0, 0.0, 10.0, "anchoa boqueron"),
+    ("Gambas", 99, 24.0, 0.2, 0.3, "gamba langostino marisco"),
+    ("Mejillones", 86, 12.0, 3.7, 2.2, "marisco"),
+    ("Calamares", 92, 15.6, 3.1, 1.4, "calamar chipirones marisco"),
+    ("Pulpo", 82, 15.0, 2.2, 1.0, "marisco"),
+    # ---- Huevos y lácteos ----
+    ("Huevo Entero", 155, 13.0, 1.1, 11.0, "huevos"),
+    ("Claras de Huevo", 52, 11.0, 0.7, 0.2, "clara huevo"),
+    ("Yema de Huevo", 322, 16.0, 3.6, 27.0, "yema huevo"),
+    ("Leche entera", 61, 3.2, 4.8, 3.3, "leche"),
+    ("Leche semidesnatada", 46, 3.3, 4.8, 1.6, "leche"),
+    ("Leche desnatada", 34, 3.4, 5.0, 0.1, "leche"),
+    ("Yogur natural", 61, 3.5, 4.7, 3.3, "yogurt"),
+    ("Yogur griego", 97, 9.0, 4.0, 5.0, "yogurt"),
+    ("Yogur desnatado", 45, 4.3, 6.0, 0.2, "yogurt"),
+    ("Skyr", 63, 11.0, 4.0, 0.2, "yogur proteico"),
+    ("Queso cottage", 98, 11.0, 3.4, 4.3, ""),
+    ("Queso fresco", 174, 12.0, 3.0, 12.5, "burgos"),
+    ("Mozzarella", 280, 18.0, 2.2, 22.0, ""),
+    ("Queso curado", 400, 26.0, 0.5, 33.0, "manchego"),
+    ("Queso emmental", 380, 28.0, 0.5, 29.0, ""),
+    ("Parmesano", 431, 38.0, 4.1, 29.0, "queso"),
+    ("Queso crema", 342, 6.0, 4.0, 34.0, "philadelphia"),
+    ("Mantequilla", 717, 0.9, 0.1, 81.0, ""),
+    ("Bebida de soja", 33, 3.3, 1.0, 1.8, "leche de soja"),
+    ("Bebida de almendras", 24, 0.9, 0.1, 1.9, "leche de almendras"),
+    ("Bebida de avena", 43, 0.3, 7.0, 1.5, "leche de avena"),
+    # ---- Frutos secos y semillas ----
+    ("Almendras", 579, 21.0, 22.0, 50.0, "frutos secos"),
+    ("Nueces", 654, 15.0, 14.0, 65.0, "frutos secos"),
+    ("Cacahuetes", 567, 26.0, 16.0, 49.0, "mani frutos secos"),
+    ("Avellanas", 628, 15.0, 17.0, 61.0, "frutos secos"),
+    ("Pistachos", 560, 20.0, 28.0, 45.0, "frutos secos"),
+    ("Anacardos", 553, 18.0, 30.0, 44.0, "frutos secos"),
+    ("Mantequilla de cacahuete", 588, 25.0, 20.0, 50.0, "crema de cacahuete"),
+    ("Semillas de chía", 486, 17.0, 42.0, 31.0, "chia"),
+    ("Semillas de lino", 534, 18.0, 29.0, 42.0, "linaza"),
+    ("Pipas de girasol", 584, 21.0, 20.0, 51.0, "semillas"),
+    # ---- Aceites, salsas y dulces ----
+    ("Aceite de oliva", 884, 0.0, 0.0, 100.0, "aove"),
+    ("Aceite de girasol", 884, 0.0, 0.0, 100.0, ""),
+    ("Mayonesa", 680, 1.0, 0.6, 75.0, ""),
+    ("Ketchup", 112, 1.7, 26.0, 0.1, "kétchup"),
+    ("Azúcar", 387, 0.0, 100.0, 0.0, "azucar"),
+    ("Miel", 304, 0.3, 82.0, 0.0, ""),
+    ("Mermelada", 250, 0.4, 60.0, 0.1, "confitura"),
+    ("Chocolate negro", 598, 7.8, 45.9, 42.6, "chocolate 70"),
+    ("Chocolate con leche", 535, 7.6, 59.0, 30.0, ""),
+    ("Cacao en polvo", 228, 19.6, 57.9, 13.7, "cacao"),
+    ("Proteína whey (polvo)", 400, 80.0, 8.0, 6.0, "proteina suero batido"),
+    # ---- Bebidas y otros ----
+    ("Zumo de naranja", 45, 0.7, 10.4, 0.2, "zumo jugo"),
+    ("Cerveza", 43, 0.5, 3.6, 0.0, ""),
+    ("Vino tinto", 85, 0.1, 2.6, 0.0, "vino"),
+    ("Refresco de cola", 42, 0.0, 10.6, 0.0, "coca cola"),
+    ("Café solo", 2, 0.1, 0.0, 0.0, "cafe"),
+    ("Tortilla de patatas", 170, 6.5, 12.0, 11.0, "tortilla española"),
+    ("Patatas fritas (bolsa)", 536, 7.0, 53.0, 34.0, "papas chips"),
+    ("Pizza margarita", 266, 11.0, 33.0, 10.0, ""),
+]
+
+
+def norm_text(txt):
+    """Minúsculas y sin acentos, para comparar búsquedas ('platano' = 'Plátano')."""
+    import unicodedata
+
+    t = unicodedata.normalize("NFD", str(txt or "").lower())
+    return "".join(ch for ch in t if unicodedata.category(ch) != "Mn").strip()
+
+
+def _word_match(tok, words):
+    """El término coincide con el inicio de una palabra ('pollo' no coincide con 'repollo');
+    también acepta plurales ('mandarinas' coincide con 'mandarina')."""
+    return any(w.startswith(tok) or (len(w) >= 4 and tok.startswith(w)) for w in words)
+
+
+def search_basic_foods(query, limit=10):
+    """Alimentos básicos que coinciden con la búsqueda, los más exactos primero."""
+    q = norm_text(query)
+    if not q:
+        return []
+    toks = q.split()
+    out = []
+    for idx, (name, k, p, c, f, alias) in enumerate(BASIC_FOODS):
+        n = norm_text(name)
+        name_words = n.replace("(", " ").replace(")", " ").split()
+        alias_words = norm_text(alias).split()
+        if not all(_word_match(t, name_words + alias_words) for t in toks):
+            continue
+        in_name = all(_word_match(t, name_words) for t in toks)
+        if n == q or (len(toks) == 1 and name_words[:1] == toks):
+            score = 100 if n == q else 90
+        elif n.startswith(q):
+            score = 80
+        elif in_name:
+            score = 60
+        else:
+            score = 30  # solo coincide por sinónimo
+        out.append((score - idx * 0.001, {"name": name, "kcal": k, "p": p, "c": c, "f": f}))
+    out.sort(key=lambda x: -x[0])
+    return [o[1] for o in out[:limit]]
+
+
+# Palabras que delatan productos elaborados: se penalizan salvo que el usuario las busque
+OFF_PENALTY = {
+    "zumo", "jugo", "nectar", "bebida", "refresco", "mermelada", "yogur", "yogurt", "helado", "batido",
+    "sirope", "licor", "gominolas", "gominola", "caramelo", "caramelos", "galleta", "galletas",
+    "bizcocho", "tarta", "compota", "sabor", "aroma", "gelatina", "postre", "snack", "barrita",
+    "mermeladas", "cereales", "infusion", "te", "smoothie", "pure", "conserva", "almibar",
+}
+
+
+def rank_off_products(query, products, limit=6):
+    """Ordena resultados de OpenFoodFacts: nombres que contienen la búsqueda, cortos y sin elaborados."""
+    q = norm_text(query)
+    toks = q.split()
+    penalty = OFF_PENALTY - set(toks)
+    scored, seen = [], set()
+    for prod in products:
+        name = (prod.get("product_name_es") or prod.get("product_name") or "").strip()
+        if not name:
+            continue
+        nutr = off_nutri(prod.get("nutriments"))
+        if nutr[0] <= 0 and sum(nutr[1:]) <= 0:
+            continue
+        n = norm_text(name)
+        if n in seen:
+            continue
+        seen.add(n)
+        words = n.split()
+        has_all = all(t in n for t in toks)
+        score = 0
+        if n == q:
+            score += 100
+        elif n.startswith(q):
+            score += 40
+        if words and words[0] == toks[0]:
+            score += 20
+        if has_all:
+            score += 30
+        if any(w in penalty for w in words):
+            score -= 60
+        score -= len(words)
+        scored.append((has_all, score, prod, name, nutr))
+    scored.sort(key=lambda x: (-int(x[0]), -x[1]))
+    chosen = [x for x in scored if x[0]] or scored[:3]
+    return [
+        {
+            "name": name,
+            "kcal": nutr[0], "p": nutr[1], "c": nutr[2], "f": nutr[3],
+            "image": prod.get("image_front_small_url") or prod.get("image_url"),
+        }
+        for _, _, prod, name, nutr in chosen[:limit]
+    ]
+
+
+def off_search(query):
+    """Busca en OpenFoodFacts (productos de España primero) y devuelve los mejores resultados."""
+    base = {
+        "search_terms": query, "search_simple": 1, "action": "process", "json": 1,
+        "page_size": 30, "sort_by": "unique_scans_n", "lc": "es",
+        "fields": "product_name,product_name_es,nutriments,image_front_small_url,image_url",
+    }
+    headers = {"User-Agent": "GymMacroProApp - Mobile - Version 3.0"}
+    results = []
+    for extra in (
+        {"tagtype_0": "countries", "tag_contains_0": "contains", "tag_0": "spain"},
+        {},
+    ):
+        try:
+            resp = requests.get(
+                "https://world.openfoodfacts.org/cgi/search.pl",
+                params={**base, **extra}, headers=headers, timeout=7,
+            ).json()
+            results = rank_off_products(query, resp.get("products", []))
+        except Exception:
+            results = []
+        if len(results) >= 3:
+            break
+    return results
 
 
 def lookup_product(code):
@@ -2365,7 +2699,7 @@ def main(page: ft.Page):
         render_meal_selector_pills()
 
         tf_search = ft.TextField(
-            label="Buscar (ej. Pollo, Arroz, Avena, Huevo)",
+            label="Buscar (ej. mandarina, pollo, arroz, huevo)",
             bgcolor="#ffffff",
             border_radius=10,
             border_color="#E4DFD3",
@@ -2434,10 +2768,13 @@ def main(page: ft.Page):
                 food_preview.controls = []
                 food_preview.visible = False
 
-        def fill_food_form(name, kcal, p, c, f, image=None):
+        search_state = {"gen": 0}
+
+        def fill_food_form(name, kcal, p, c, f, image=None, grams=100):
+            search_state["gen"] += 1  # descarta búsquedas en curso
             set_food_image(image)
             tf_name.value = name
-            tf_grams.value = "100"
+            tf_grams.value = str(grams)
             tf_kcal.value = str(round(float(kcal or 0), 1))
             tf_p.value = str(round(float(p or 0), 1))
             tf_c.value = str(round(float(c or 0), 1))
@@ -2446,134 +2783,105 @@ def main(page: ft.Page):
             switch_tab(1)
             notify(f"Cargado: {name}")
 
-        GYM_FOODS_DB = {
-            "pollo": [
-                {"name": "Pechuga de Pollo", "kcal": 105, "p": 23.0, "c": 0.0, "f": 1.2},
-                {"name": "Muslo de Pollo", "kcal": 177, "p": 20.0, "c": 0.0, "f": 10.5},
-            ],
-            "arroz": [
-                {"name": "Arroz Blanco (Cocido)", "kcal": 130, "p": 2.7, "c": 28.0, "f": 0.3},
-                {"name": "Arroz Blanco (Crudo)", "kcal": 350, "p": 7.0, "c": 78.0, "f": 1.0},
-            ],
-            "avena": [
-                {"name": "Copos de Avena", "kcal": 389, "p": 16.9, "c": 66.3, "f": 6.9}
-            ],
-            "atun": [
-                {"name": "Atún al Natural", "kcal": 103, "p": 24.0, "c": 0.0, "f": 1.0},
-                {"name": "Atún en Aceite", "kcal": 190, "p": 22.0, "c": 0.0, "f": 11.0},
-            ],
-            "huevo": [
-                {"name": "Huevo Entero", "kcal": 155, "p": 13.0, "c": 1.1, "f": 11.0},
-                {"name": "Claras de Huevo", "kcal": 52, "p": 11.0, "c": 0.7, "f": 0.2},
-            ],
-            "platano": [
-                {"name": "Plátano", "kcal": 89, "p": 1.1, "c": 22.8, "f": 0.3}
-            ],
-        }
-
-        def search_openfoodfacts(e):
-            query = (tf_search.value or "").strip().lower()
-            if not query:
-                return
-            search_results.controls.clear()
-            search_results.controls.append(
-                ft.Text("Buscando...", color="#24543F", size=13)
+        def food_result_card(name, k, p, c, f, img=None, tag="Elegir", tag_color="#24543F", grams=100):
+            return ft.Container(
+                bgcolor="#ffffff", padding=12, border_radius=10, border=CARD_BORDER,
+                on_click=lambda e, n=name, k=k, p=p, c=c, f=f, im=img, g=grams: fill_food_form(n, k, p, c, f, im, g),
+                content=ft.Row(
+                    ([food_thumb(img)] if img else [])
+                    + [
+                        ft.Column(
+                            [
+                                ft.Text(name, weight=ft.FontWeight.W_600, size=14, color="#1C1B18"),
+                                ft.Text(
+                                    f"100g: {int(k)} kcal | C: {c:.1f}g | P: {p:.1f}g | G: {f:.1f}g",
+                                    size=11, color="#77736A",
+                                ),
+                            ],
+                            spacing=2, expand=True,
+                        ),
+                        ft.Text(tag, color=tag_color, size=11, weight=ft.FontWeight.W_600),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
             )
-            page.update()
-            search_results.controls.clear()
 
-            for key, items in GYM_FOODS_DB.items():
-                if key in query or query in key:
-                    for item in items:
-                        search_results.controls.append(
-                            ft.Container(
-                                bgcolor="#ffffff",
-                                padding=12,
-                                border_radius=10,
-                                shadow=CARD_SHADOW, border=CARD_BORDER,
-                                on_click=lambda e, n=item["name"], k=item["kcal"], p=item["p"], c=item["c"], f=item["f"]: fill_food_form(
-                                    n, k, p, c, f
-                                ),
-                                content=ft.Row(
-                                    [
-                                        ft.Column(
-                                            [
-                                                ft.Text(
-                                                    item['name'],
-                                                    weight=ft.FontWeight.W_600,
-                                                    size=14,
-                                                    color="#1C1B18",
-                                                ),
-                                                ft.Text(
-                                                    f"100g: {item['kcal']} kcal | C: {item['c']}g | P: {item['p']}g | G: {item['f']}g",
-                                                    size=11,
-                                                    color="#77736A",
-                                                ),
-                                            ],
-                                            expand=True,
-                                        ),
-                                        ft.Text("Elegir", color="#24543F", weight=ft.FontWeight.W_600),
-                                    ]
-                                ),
-                            )
-                        )
+        # Desplegable de alimentos añadidos hace poco (se ve al enfocar o escribir en el buscador)
+        recents_box = ft.Container(visible=False)
 
-            try:
-                resp = requests.get(
-                    "https://world.openfoodfacts.org/cgi/search.pl",
-                    params={
-                        "search_terms": query, "search_simple": 1, "action": "process",
-                        "json": 1, "page_size": 4,
-                    },
-                    headers=OFF_HEADERS,
-                    timeout=6,
-                ).json()
-                for prod in resp.get("products", []):
-                    pname = prod.get("product_name") or "Alimento"
-                    img = prod.get("image_front_small_url") or prod.get("image_url")
-                    k, p, c, f = off_nutri(prod.get("nutriments"))
-                    search_results.controls.append(
-                        ft.Container(
-                            bgcolor="#ffffff",
-                            padding=12,
-                            border_radius=10,
-                            on_click=lambda e, n=pname, k=k, p=p, c=c, f=f, im=img: fill_food_form(
-                                n, k, p, c, f, im
-                            ),
-                            content=ft.Row(
-                                [
-                                    food_thumb(img),
-                                    ft.Column(
-                                        [
-                                            ft.Text(
-                                                pname,
-                                                weight=ft.FontWeight.W_600,
-                                                size=13,
-                                                color="#3A3832",
-                                            ),
-                                            ft.Text(
-                                                f"100g: {int(k)} kcal | C: {c:.1f}g | P: {p:.1f}g | G: {f:.1f}g",
-                                                size=11,
-                                                color="#77736A",
-                                            ),
-                                        ],
-                                        expand=True,
-                                    ),
-                                    ft.Text("Elegir", color="#D9A441", size=12),
-                                ]
-                            ),
-                        )
+        def render_recents(filter_text=""):
+            rows = db.get_recent_foods(current_user_id[0], 12) if current_user_id[0] else []
+            q = norm_text(filter_text)
+            if q:
+                rows = [r for r in rows if q in norm_text(r["name"])]
+            rows = rows[:6]
+            if not rows or search_results.controls:
+                recents_box.visible = False
+                recents_box.content = None
+                return
+            cards = [ft.Text("Recientes", size=12, weight=ft.FontWeight.W_600, color="#77736A")]
+            for r in rows:
+                cards.append(
+                    food_result_card(
+                        r["name"], r["kcal"], r["p"], r["c"], r["f"], r["image"],
+                        "Reciente", "#C9763F", round(r["grams"]),
                     )
-            except Exception:
-                pass
+                )
+            recents_box.content = ft.Column(cards, spacing=6)
+            recents_box.visible = True
 
+        def on_search_focus(e=None):
+            render_recents(tf_search.value or "")
+            page.update()
+
+        def on_search_change(e=None):
+            search_results.controls.clear()  # los resultados anteriores ya no corresponden
+            render_recents(tf_search.value or "")
+            page.update()
+
+        async def search_openfoodfacts(e=None):
+            query = (tf_search.value or "").strip()
+            if not query:
+                render_recents("")
+                page.update()
+                return
+            search_state["gen"] += 1
+            my = search_state["gen"]
+            search_results.controls.clear()
+            recents_box.visible = False
+            # 1) Alimentos básicos al instante (mandarina, pollo, arroz…)
+            for it in search_basic_foods(query):
+                search_results.controls.append(
+                    food_result_card(it["name"], it["kcal"], it["p"], it["c"], it["f"], None, "Básico")
+                )
+            loading = ft.Text("Buscando más productos…", color="#24543F", size=12)
+            search_results.controls.append(loading)
+            page.update()
+            # 2) Productos de OpenFoodFacts, filtrados y ordenados, en segundo plano
+            try:
+                prods = await asyncio.to_thread(off_search, query)
+            except Exception:
+                prods = []
+            if search_state["gen"] != my:
+                return
+            try:
+                search_results.controls.remove(loading)
+            except ValueError:
+                pass
+            for it in prods:
+                search_results.controls.append(
+                    food_result_card(it["name"], it["kcal"], it["p"], it["c"], it["f"], it["image"], "Producto", "#D9A441")
+                )
             if not search_results.controls:
                 search_results.controls.append(
-                    ft.Text("Sin resultados.", color="#77736A")
+                    ft.Text("Sin resultados. Prueba otra palabra o descríbelo en la pestaña IA.", color="#77736A")
                 )
             page.update()
 
-        sw_fixed = ft.Switch(label="Guardar también como comida fija", value=False)
+        tf_search.on_focus = on_search_focus
+        tf_search.on_change = on_search_change
+        tf_search.on_submit = search_openfoodfacts
+
 
         def save_food_entry(e):
             try:
@@ -2588,14 +2896,6 @@ def main(page: ft.Page):
                 meal_dest = selected_meal_for_add[0]
                 db.add_food(current_user_id[0], meal_dest, name, grams, k, p, c, f, current_food_image[0])
                 extra = ""
-                if sw_fixed.value:
-                    db.save_meal(
-                        current_user_id[0], name, meal_dest,
-                        [{"name": name, "grams": grams, "kcal": k, "p": p, "c": c, "f": f,
-                          "image": current_food_image[0]}],
-                    )
-                    sw_fixed.value = False
-                    extra = " y guardado como comida fija"
                 for field in (tf_name, tf_kcal, tf_p, tf_c, tf_f):
                     field.value = ""
                 tf_grams.value = "100"
@@ -2606,8 +2906,9 @@ def main(page: ft.Page):
             except ValueError:
                 notify("Rellena los gramos y macros con números", "#B8453A")
 
-        # ----- COMIDAS FIJAS -----
+        # ----- MIS COMIDAS (comidas personalizadas que registras y añades cuando quieras) -----
         saved_col = ft.Column(spacing=8)
+        mm_state = {"items": []}
 
         def add_items_to_log(items, meal_dest):
             for it in items:
@@ -2617,7 +2918,11 @@ def main(page: ft.Page):
                 )
             expanded_meal[0] = meal_dest
 
+        def _mm_line(it):
+            return f"{int(it['kcal'])} kcal • P {it['p']:.1f}g • C {it['c']:.1f}g • G {it['f']:.1f}g"
+
         def save_fixed_dialog(items, default_name="Mi comida", meal_type=None):
+            """Guarda una lista de alimentos en Mis comidas pidiendo un nombre."""
             if not items:
                 notify("No hay alimentos que guardar", "#B8453A")
                 return
@@ -2627,12 +2932,14 @@ def main(page: ft.Page):
                 nm = (name_field.value or "").strip() or default_name
                 db.save_meal(current_user_id[0], nm, meal_type or selected_meal_for_add[0], items)
                 page.pop_dialog()
-                notify(f"'{nm}' guardada en comidas fijas", "#3F7D58")
+                render_saved_meals()
+                page.update()
+                notify(f"'{nm}' guardada en Mis comidas", "#3F7D58")
 
             page.show_dialog(
                 ft.AlertDialog(
                     modal=True,
-                    title=ft.Text("Guardar como comida fija"),
+                    title=ft.Text("Guardar en Mis comidas"),
                     content=name_field,
                     actions=[
                         ft.TextButton("Cancelar", on_click=lambda e: page.pop_dialog()),
@@ -2642,11 +2949,11 @@ def main(page: ft.Page):
             )
 
         def use_saved_meal(sid):
-            for s_id, _, _, items in db.get_saved_meals(current_user_id[0]):
+            for s_id, sname, _, items in db.get_saved_meals(current_user_id[0]):
                 if s_id == sid:
                     meal_dest = selected_meal_for_add[0]
                     add_items_to_log(items, meal_dest)
-                    notify(f"Añadido a {meal_dest}", "#3F7D58")
+                    notify(f"'{sname}' añadida a {meal_dest}", "#3F7D58")
                     switch_tab(0)
                     return
 
@@ -2661,15 +2968,12 @@ def main(page: ft.Page):
             if not meals:
                 saved_col.controls.append(
                     ft.Text(
-                        "Aún no tienes comidas fijas. Guárdalas desde 'Hoy' o desde la IA.",
+                        "Aún no tienes comidas. Pulsa «Crear comida» o guarda una desde el Historial.",
                         size=12, color="#A9A59B",
                     )
                 )
-            for sid, sname, _, items in meals:
-                tk = sum(i["kcal"] for i in items)
-                tp_ = sum(i["p"] for i in items)
-                tc_ = sum(i["c"] for i in items)
-                tf_ = sum(i["f"] for i in items)
+            for sid, sname, mtype, items in meals:
+                tot = {k: sum(i[k] for i in items) for k in ("kcal", "p", "c", "f")}
                 saved_col.controls.append(
                     ft.Container(
                         bgcolor="#ffffff", border_radius=10, padding=12, shadow=CARD_SHADOW, border=CARD_BORDER,
@@ -2678,16 +2982,17 @@ def main(page: ft.Page):
                                 ft.Column(
                                     [
                                         ft.Text(sname, size=14, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                        ft.Text(_mm_line(tot), size=11, color="#77736A"),
                                         ft.Text(
-                                            f"{int(tk)} kcal • P {int(tp_)}g • C {int(tc_)}g • G {int(tf_)}g",
-                                            size=11, color="#77736A",
+                                            ", ".join(f"{i['name']} {int(i['grams'])}g" for i in items),
+                                            size=11, color="#A9A59B",
                                         ),
-                                        ft.Text(", ".join(i["name"] for i in items), size=11, color="#A9A59B"),
                                     ],
                                     spacing=2, expand=True,
                                 ),
                                 ft.Container(
                                     padding=10, bgcolor="#24543F", border_radius=8,
+                                    tooltip="Añadir a la comida seleccionada",
                                     on_click=lambda e, s_=sid: use_saved_meal(s_),
                                     content=ft.Icon(ft.Icons.ADD, size=18, color="white"),
                                 ),
@@ -2702,6 +3007,170 @@ def main(page: ft.Page):
                     )
                 )
 
+        # -- Constructor: crear una comida personalizada --
+        _fld = dict(bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3")
+        tf_mm_name = ft.TextField(label="Nombre de la comida", hint_text="Ej: Mi desayuno de avena", **_fld)
+        tf_mm_ai = ft.TextField(
+            label="Descríbela y la IA calcula",
+            hint_text="Ej: 60 g de avena, 1 plátano y 200 ml de leche",
+            multiline=True, min_lines=2, max_lines=4, **_fld,
+        )
+        tf_mm_iname = ft.TextField(label="Alimento", **_fld)
+        tf_mm_igrams = ft.TextField(label="Gramos", expand=True, keyboard_type=ft.KeyboardType.NUMBER, **_fld)
+        tf_mm_ikcal = ft.TextField(label="Kcal", expand=True, keyboard_type=ft.KeyboardType.NUMBER, **_fld)
+        tf_mm_ip = ft.TextField(label="Prot. g", expand=True, keyboard_type=ft.KeyboardType.NUMBER, **_fld)
+        tf_mm_ic = ft.TextField(label="Carb. g", expand=True, keyboard_type=ft.KeyboardType.NUMBER, **_fld)
+        tf_mm_if = ft.TextField(label="Grasa g", expand=True, keyboard_type=ft.KeyboardType.NUMBER, **_fld)
+        mm_items_col = ft.Column(spacing=6)
+        mm_total_txt = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#24543F")
+        mm_loading = ft.Row(
+            [ft.ProgressRing(width=18, height=18, stroke_width=3), ft.Text("Calculando…", size=13, color="#77736A")],
+            visible=False,
+        )
+
+        def _num_or_zero(v):
+            v = str(v or "").replace(",", ".").strip()
+            return float(v) if v else 0.0
+
+        def render_mm_items():
+            mm_items_col.controls.clear()
+            items = mm_state["items"]
+            for idx, it in enumerate(items):
+                mm_items_col.controls.append(
+                    ft.Container(
+                        bgcolor="#FAF8F4", border_radius=8, padding=ft.Padding(left=10, right=4, top=6, bottom=6),
+                        content=ft.Row(
+                            [
+                                ft.Column(
+                                    [
+                                        ft.Text(f"{it['name']} ({int(it['grams'])} g)", size=13,
+                                                weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                        ft.Text(_mm_line(it), size=11, color="#77736A"),
+                                    ],
+                                    spacing=1, expand=True,
+                                ),
+                                ft.IconButton(
+                                    icon=ft.Icons.CLOSE, icon_color="#B8453A", icon_size=18,
+                                    on_click=lambda e, i=idx: remove_mm_item(i),
+                                ),
+                            ],
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                        ),
+                    )
+                )
+            if items:
+                tot = {k: sum(i[k] for i in items) for k in ("kcal", "p", "c", "f")}
+                mm_total_txt.value = "Total: " + _mm_line(tot)
+            else:
+                mm_total_txt.value = "Aún no has añadido alimentos."
+
+        def remove_mm_item(i):
+            if 0 <= i < len(mm_state["items"]):
+                mm_state["items"].pop(i)
+            render_mm_items()
+            page.update()
+
+        def add_mm_manual(e=None):
+            name = (tf_mm_iname.value or "").strip()
+            try:
+                grams = _num_or_zero(tf_mm_igrams.value)
+                k, p, c, f = (_num_or_zero(x.value) for x in (tf_mm_ikcal, tf_mm_ip, tf_mm_ic, tf_mm_if))
+            except ValueError:
+                notify("Usa números en gramos y macros", "#B8453A")
+                return
+            if not name or grams <= 0:
+                notify("Pon el nombre y los gramos del alimento", "#B8453A")
+                return
+            if k <= 0:  # si no pones kcal se calculan con los macros
+                k = 4 * p + 4 * c + 9 * f
+            mm_state["items"].append(
+                {"name": name, "grams": round(grams), "kcal": round(k, 1), "p": round(p, 1),
+                 "c": round(c, 1), "f": round(f, 1)}
+            )
+            for fld in (tf_mm_iname, tf_mm_igrams, tf_mm_ikcal, tf_mm_ip, tf_mm_ic, tf_mm_if):
+                fld.value = ""
+            render_mm_items()
+            page.update()
+
+        async def add_mm_ai(e=None):
+            text = (tf_mm_ai.value or "").strip()
+            if not text:
+                notify("Escribe lo que lleva la comida", "#B8453A")
+                return
+            mm_loading.visible = True
+            page.update()
+            try:
+                items = await asyncio.to_thread(ai_parse_foods, text)
+            except Exception as ex:
+                mm_loading.visible = False
+                page.update()
+                notify(f"IA: {ex}", "#B8453A")
+                return
+            mm_state["items"].extend(items)
+            tf_mm_ai.value = ""
+            mm_loading.visible = False
+            render_mm_items()
+            page.update()
+
+        mm_builder = ft.Container(visible=False)
+
+        def close_mm_builder(e=None):
+            mm_builder.visible = False
+            page.update()
+
+        def save_mm(e=None):
+            name = (tf_mm_name.value or "").strip()
+            if not name:
+                notify("Ponle un nombre a la comida", "#B8453A")
+                return
+            if not mm_state["items"]:
+                notify("Añade al menos un alimento", "#B8453A")
+                return
+            db.save_meal(current_user_id[0], name, selected_meal_for_add[0], list(mm_state["items"]))
+            mm_state["items"] = []
+            tf_mm_name.value = ""
+            mm_builder.visible = False
+            render_saved_meals()
+            notify(f"'{name}' guardada en Mis comidas", "#3F7D58")
+            page.update()
+
+        mm_builder.content = ft.Container(
+            bgcolor="#ffffff", border_radius=12, padding=14, border=CARD_BORDER,
+            content=ft.Column(
+                [
+                    ft.Text("Nueva comida", size=15, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    tf_mm_name,
+                    tf_mm_ai,
+                    make_button("✨ Añadir con IA", "#1C1B18", add_mm_ai),
+                    mm_loading,
+                    ft.Text("…o añade un alimento a mano (valores totales de esa cantidad):", size=11, color="#77736A"),
+                    tf_mm_iname,
+                    ft.Row([tf_mm_igrams, tf_mm_ikcal], spacing=8),
+                    ft.Row([tf_mm_ip, tf_mm_ic, tf_mm_if], spacing=8),
+                    make_button("➕ Añadir alimento", "#24543F", add_mm_manual),
+                    ft.Divider(color="#E4DFD3"),
+                    mm_items_col,
+                    mm_total_txt,
+                    ft.Row(
+                        [
+                            make_button("✅ Guardar comida", "#3F7D58", save_mm, expand=True),
+                            make_button("✖ Cancelar", "#E4DFD3", close_mm_builder, text_color="#3A3832", expand=True),
+                        ],
+                        spacing=8,
+                    ),
+                ],
+                spacing=8,
+            ),
+        )
+
+        def open_mm_builder(e=None):
+            mm_state["items"] = []
+            tf_mm_name.value = ""
+            tf_mm_ai.value = ""
+            render_mm_items()
+            mm_builder.visible = True
+            page.update()
+
         def save_today_meal_as_fixed(e=None):
             mn = selected_meal_for_add[0]
             foods = [x for x in db.get_today_foods(current_user_id[0]) if x[1] == mn]
@@ -2713,6 +3182,27 @@ def main(page: ft.Page):
                 f"{mn} habitual",
                 mn,
             )
+
+        my_meals_section = ft.Column(
+            [
+                ft.Text("Mis comidas", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                ft.Text(
+                    "Registra tus comidas personalizadas y añádelas cuando quieras con +. "
+                    "Se suman a la comida seleccionada arriba.",
+                    size=12, color="#77736A",
+                ),
+                make_button("➕ Crear comida", "#24543F", open_mm_builder),
+                mm_builder,
+                saved_col,
+                make_button("⭐ Guardar lo de hoy como comida", "#C9763F", save_today_meal_as_fixed),
+                ft.Text(
+                    "Guarda lo que ya has registrado hoy en la comida seleccionada arriba. "
+                    "También puedes guardar una comida desde el Historial.",
+                    size=11, color="#A9A59B",
+                ),
+            ],
+            spacing=10,
+        )
 
         view_add = ft.Container(
             padding=18,
@@ -2733,6 +3223,7 @@ def main(page: ft.Page):
                             ),
                         ]
                     ),
+                    recents_box,
                     search_results,
                     ft.Divider(color="#E4DFD3"),
                     food_preview,
@@ -2740,19 +3231,9 @@ def main(page: ft.Page):
                     tf_grams,
                     ft.Row([tf_kcal, tf_p]),
                     ft.Row([tf_c, tf_f]),
-                    sw_fixed,
                     make_button("Registrar alimento", "#24543F", save_food_entry),
                     ft.Divider(color="#E4DFD3"),
-                    ft.Text("Mis comidas fijas", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
-                    ft.Text("Pulsa + para añadirlas a la comida seleccionada arriba.", size=12, color="#77736A"),
-                    saved_col,
-                    make_button(
-                        "⭐ Guardar lo de hoy como comida fija", "#C9763F", save_today_meal_as_fixed,
-                    ),
-                    ft.Text(
-                        "Guarda todo lo que ya has registrado hoy en la comida seleccionada arriba.",
-                        size=11, color="#A9A59B",
-                    ),
+                    my_meals_section,
                 ],
                 scroll=ft.ScrollMode.AUTO,
                 expand=True,
@@ -2792,17 +3273,6 @@ def main(page: ft.Page):
         ai_result_col = ft.Column(spacing=8)
         ai_suggest_col = ft.Column(spacing=10)
 
-        sw_fixed_ai = ft.Switch(label="Guardar también como comida fija", value=False)
-        tf_fixed_ai_name = ft.TextField(
-            label="Nombre de la comida fija", value="Mi comida habitual", visible=False,
-            bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3",
-        )
-
-        def toggle_fixed_ai(e=None):
-            tf_fixed_ai_name.visible = bool(sw_fixed_ai.value)
-            page.update()
-
-        sw_fixed_ai.on_change = toggle_fixed_ai
 
         def set_busy(flag, msg="Pensando…"):
             ai_loading_txt.value = msg
@@ -2934,12 +3404,6 @@ def main(page: ft.Page):
             items = list(ai_state["items"])
             add_items_to_log(items, meal_dest)
             extra = ""
-            if sw_fixed_ai.value:
-                nm = (tf_fixed_ai_name.value or "").strip() or "Mi comida habitual"
-                db.save_meal(current_user_id[0], nm, meal_dest, items)
-                sw_fixed_ai.value = False
-                tf_fixed_ai_name.visible = False
-                extra = " y guardada como fija"
             ai_state["items"] = []
             tf_ai.value = ""
             ai_state["photo"] = None
@@ -2983,7 +3447,12 @@ def main(page: ft.Page):
                     content=ft.Text(f"TOTAL: {macro_line(tot)}", size=12, weight=ft.FontWeight.W_600, color="white"),
                 )
             )
-            ai_result_col.controls.append(ft.Column([sw_fixed_ai, tf_fixed_ai_name], spacing=4))
+            ai_result_col.controls.append(
+                make_button(
+                    "⭐ Guardar en Mis comidas", "#C9763F",
+                    lambda e: save_fixed_dialog(list(ai_state["items"]), "Mi comida", selected_meal_for_add[0]),
+                )
+            )
             ai_result_col.controls.append(
                 make_button(f"✅ Registrar en {selected_meal_for_add[0]}", "#3F7D58", register_ai)
             )
@@ -3163,7 +3632,7 @@ def main(page: ft.Page):
                         ),
                     )
                 else:
-                    sw = ft.Switch(label="Guardar también como comida fija", value=False)
+                    sw = ft.Switch(label="Guardar también en Mis comidas", value=False)
                     plan_state["switches"][i] = sw
                     action = ft.Column(
                         [sw, make_button(f"➕ Registrar en {plan['meal']}", "#3F7D58", lambda e, k=i: on_register_one(k))],
@@ -3333,7 +3802,7 @@ def main(page: ft.Page):
         async def search_barcode(e=None):
             await process_code_string(tf_barcode.value)
 
-        scan_state = {"active": False, "gen": 0}
+        scan_state = {"active": False, "gen": 0, "capturing": False}
         has_cv_barcode, has_zbar = barcode_engines()
 
         def close_camera_inline(ev=None):
@@ -3357,32 +3826,77 @@ def main(page: ft.Page):
 
             scan_state["gen"] += 1
             my_gen = scan_state["gen"]
-            status_lbl = ft.Text("Apunta al código: se leerá solo, sin pulsar nada", size=12, color="#77736A")
+            status_lbl = ft.Text(
+                "Apunta al código: se lee solo. Si tarda, pulsa Capturar con el código bien centrado.",
+                size=12, color="#77736A",
+            )
+
+            async def handle_found(data):
+                if not (scan_state["active"] and scan_state["gen"] == my_gen):
+                    return
+                scan_state["active"] = False
+                tf_barcode.value = data
+                close_camera_inline()
+                await process_code_string(data)
+
+            async def decode_and_handle(image_bytes, deep):
+                data = await asyncio.to_thread(decode_frame, image_bytes, deep)
+                if data:
+                    await handle_found(data)
 
             async def auto_scan_loop():
+                """Hace fotos sin parar y las decodifica en segundo plano (sin esperar a la anterior)."""
                 if scan_state["gen"] != my_gen:
                     return
                 scan_state["active"] = True
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.4)
                 tries = 0
+                inflight = None
                 while scan_state["active"] and scan_state["gen"] == my_gen:
+                    if scan_state["capturing"]:
+                        await asyncio.sleep(0.2)
+                        continue
                     tries += 1
                     try:
                         image_bytes = await cam.take_picture()
-                        if image_bytes:
-                            # La decodificación va en otro hilo para no congelar la pantalla
-                            data = await asyncio.to_thread(decode_frame, image_bytes)
-                            if data and scan_state["active"] and scan_state["gen"] == my_gen:
-                                tf_barcode.value = data
-                                close_camera_inline()
-                                await process_code_string(data)
-                                return
+                        if image_bytes and (inflight is None or inflight.done()):
+                            # pasada rápida casi siempre; cada 4ª, profunda
+                            inflight = asyncio.create_task(decode_and_handle(image_bytes, tries % 4 == 0))
                     except Exception as ex:
                         print("Error escaneo:", ex)
-                    if tries == 12 and scan_state["gen"] == my_gen:
-                        status_lbl.value = "Aún nada… prueba a acercar o alejar el código, con buena luz y recto"
+                    if tries == 30 and scan_state["gen"] == my_gen and not scan_state["capturing"]:
+                        status_lbl.value = "Aún nada… acerca o aleja el código, con buena luz, y pulsa Capturar"
                         page.update()
-                    await asyncio.sleep(0.35)
+                    await asyncio.sleep(0.05)
+
+            async def capture_now(ev=None):
+                """Captura manual: foto fija y lectura profunda (como el escáner de antes)."""
+                if scan_state["capturing"]:
+                    return
+                scan_state["capturing"] = True
+                status_lbl.value = "Leyendo el código…"
+                page.update()
+                try:
+                    found = ""
+                    for _ in range(2):
+                        image_bytes = await cam.take_picture()
+                        if image_bytes:
+                            found = await asyncio.to_thread(decode_frame, image_bytes, True, 2000)
+                            if found:
+                                break
+                        await asyncio.sleep(0.15)
+                    if found:
+                        await handle_found(found)
+                    else:
+                        status_lbl.value = (
+                            "No pude leerlo. Céntralo, evita reflejos, ajusta la distancia y pulsa Capturar otra vez"
+                        )
+                        page.update()
+                except Exception as ex:
+                    status_lbl.value = f"Error al capturar: {ex}"
+                    page.update()
+                finally:
+                    scan_state["capturing"] = False
 
             camera_holder.content = ft.Container(
                 bgcolor="#ffffff",
@@ -3399,7 +3913,13 @@ def main(page: ft.Page):
                             content=cam,
                         ),
                         status_lbl,
-                        make_button("✖ Cerrar", "#B8453A", close_camera_inline),
+                        ft.Row(
+                            [
+                                make_button("📸 Capturar", "#24543F", capture_now, expand=True),
+                                make_button("✖ Cerrar", "#B8453A", close_camera_inline, expand=True),
+                            ],
+                            spacing=8,
+                        ),
                     ],
                     spacing=10,
                 ),
@@ -3568,6 +4088,30 @@ def main(page: ft.Page):
         history_summary = ft.Text("", size=13, color="#3A3832")
         history_col = ft.Column(spacing=10)
 
+        def hist_items(m_foods):
+            return [
+                {"name": x[3], "grams": x[4], "kcal": x[5], "p": x[6], "c": x[7], "f": x[8], "image": x[9]}
+                for x in m_foods
+            ]
+
+        def copy_meal_to_today(m_foods, m_name, label):
+            add_items_to_log(hist_items(m_foods), m_name)
+            notify(f"{m_name} de «{label}» copiado a hoy", "#3F7D58")
+            refresh_history()
+
+        def hist_btn(label, icon, cb):
+            return ft.Container(
+                padding=ft.Padding(left=10, right=10, top=6, bottom=6),
+                border_radius=8, bgcolor="#E3ECE6", on_click=cb,
+                content=ft.Row(
+                    [
+                        ft.Icon(icon, size=14, color="#24543F"),
+                        ft.Text(label, size=12, weight=ft.FontWeight.W_600, color="#24543F"),
+                    ],
+                    spacing=5, tight=True,
+                ),
+            )
+
         def toggle_history_day(day_iso):
             history_open[0] = None if history_open[0] == day_iso else day_iso
             refresh_history()
@@ -3690,6 +4234,23 @@ def main(page: ft.Page):
                                             )
                                             for x in m_foods
                                         ],
+                                        ft.Row(
+                                            ([] if d == today else [
+                                                hist_btn(
+                                                    "Copiar a hoy", ft.Icons.CONTENT_COPY,
+                                                    lambda e, mf=m_foods, mn=m_name, lb=label: copy_meal_to_today(mf, mn, lb),
+                                                )
+                                            ])
+                                            + [
+                                                hist_btn(
+                                                    "Guardar en Mis comidas", ft.Icons.STAR_OUTLINE,
+                                                    lambda e, mf=m_foods, mn=m_name, lb=label: save_fixed_dialog(
+                                                        hist_items(mf), f"{mn} ({lb})", mn
+                                                    ),
+                                                )
+                                            ],
+                                            spacing=8, wrap=True,
+                                        ),
                                     ],
                                     spacing=3,
                                 ),
@@ -3768,6 +4329,7 @@ def main(page: ft.Page):
                 refresh_dashboard()
             elif index == 1:
                 render_saved_meals()
+                render_recents(tf_search.value or "")
             elif index == 4:
                 refresh_history()
             elif index == 5:
