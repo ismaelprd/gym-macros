@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import math
 import os
@@ -485,23 +486,29 @@ def weekly_change_kg(offset):
 AI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 
-def ask_ai(system_prompt, user_text, max_tokens=1800):
+def ask_ai(system_prompt, user_text, max_tokens=1800, image_bytes=None):
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise RuntimeError("Falta la variable GEMINI_API_KEY en Render")
+    user_parts = []
+    if image_bytes:
+        user_parts.append(
+            {"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(image_bytes).decode("ascii")}}
+        )
+    user_parts.append({"text": user_text})
     resp = requests.post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent",
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
         json={
             "systemInstruction": {"parts": [{"text": system_prompt}]},
-            "contents": [{"role": "user", "parts": [{"text": user_text}]}],
+            "contents": [{"role": "user", "parts": user_parts}],
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "maxOutputTokens": max_tokens,
                 "temperature": 0.4,
             },
         },
-        timeout=45,
+        timeout=60 if image_bytes else 45,
     )
     if resp.status_code != 200:
         raise RuntimeError(f"Error {resp.status_code}: {resp.text[:150]}")
@@ -542,6 +549,38 @@ FOOD_PARSE_PROMPT = (
     "son los TOTALES de esa porción, no por 100 g; valores realistas; nada de texto fuera del JSON."
 )
 
+FOOD_PHOTO_PROMPT = (
+    "Eres un nutricionista experto. El usuario te envía una FOTO de un plato, bocadillo o comida, "
+    "y a veces un texto con aclaraciones (ingredientes que no se ven, cantidades, marcas, cómo está "
+    "cocinado). Identifica cada alimento y estima el peso en gramos de la porción que se ve, usando "
+    "referencias visuales (tamaño del plato, cubiertos, manos, envase, grosor). Si es un plato "
+    "combinado (por ejemplo macarrones con chorizo o un bocadillo), desglósalo en sus ingredientes "
+    "principales, cada uno con su peso. Si el texto del usuario dice ingredientes o gramos, tiene "
+    "PRIORIDAD sobre lo que veas en la imagen. Si la foto no contiene comida reconocible y no hay "
+    'texto útil, devuelve {"items":[]}. Devuelve SOLO un JSON con este formato exacto: '
+    '{"items":[{"name":"...","grams":123,"kcal":0,"p":0,"c":0,"f":0}]}. Reglas: un elemento por '
+    'alimento o ingrediente; "grams" es el peso estimado de la porción; kcal, p (proteína), c '
+    "(carbohidratos) y f (grasa) son los TOTALES de esa porción, no por 100 g; valores realistas; "
+    "nada de texto fuera del JSON."
+)
+
+
+def prepare_photo(image_bytes, max_side=1024, quality=82):
+    """Reduce la foto (lado máx. 1024 px) y la convierte a JPEG para enviarla ligera a la IA."""
+    try:
+        img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return image_bytes
+        h, w = img.shape[:2]
+        scale = max_side / float(max(h, w))
+        if scale < 1:
+            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return buf.tobytes() if ok else image_bytes
+    except Exception:
+        return image_bytes
+
+
 ACTIVITY_PROMPT = (
     "Eres un fisiólogo del ejercicio. El usuario describe en español qué actividad física hace y con "
     "qué frecuencia. Estima su factor de actividad (PAL): el número por el que se multiplica su "
@@ -573,8 +612,16 @@ PLAN_PROMPT = (
     "pasos NO mencionan cantidades; máximo 4 pasos."
 )
 
-def ai_parse_foods(description):
-    data = extract_json(ask_ai(FOOD_PARSE_PROMPT, description))
+def ai_parse_foods(description, image_bytes=None):
+    if image_bytes:
+        txt = (
+            f"Aclaraciones del usuario: {description}"
+            if description
+            else "El usuario no ha escrito nada: identifica los alimentos solo por la foto."
+        )
+        data = extract_json(ask_ai(FOOD_PHOTO_PROMPT, txt, image_bytes=image_bytes))
+    else:
+        data = extract_json(ask_ai(FOOD_PARSE_PROMPT, description))
     items = []
     for it in data.get("items", []):
         name = str(it.get("name", "")).strip()
@@ -591,7 +638,11 @@ def ai_parse_foods(description):
                 }
             )
     if not items:
-        raise ValueError("No pude identificar alimentos. Prueba a describirlo de otra forma.")
+        raise ValueError(
+            "No pude identificar alimentos en la foto. Prueba con otra más cercana o añade texto."
+            if image_bytes
+            else "No pude identificar alimentos. Prueba a describirlo de otra forma."
+        )
     return items
 
 
@@ -2710,13 +2761,29 @@ def main(page: ft.Page):
         )
 
         # ----- CAPA IA: registrar por texto/voz + sugerencias -----
-        ai_state = {"items": []}
-        tf_ai = ft.TextField(
+        ai_state = {"items": [], "photo": None}
+        ai_cam_btn = ft.IconButton(
+            icon=ft.Icons.PHOTO_CAMERA_OUTLINED,
+            icon_color="#24543F",
+            tooltip="Hacer una foto a la comida",
+        )
+        _tf_ai_args = dict(
             label="¿Qué has comido?",
-            hint_text="Ej: 2 rebanadas de pan integral, 50 g de pollo y 2 cucharadas de queso cottage",
+            hint_text=(
+                "Ej: 2 rebanadas de pan integral, 50 g de pollo y 2 cucharadas de queso cottage. "
+                "Con foto: añade lo que no se ve (p. ej. «los macarrones llevan chorizo»)"
+            ),
             multiline=True, min_lines=3, max_lines=6,
             bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3",
         )
+        try:
+            tf_ai = ft.TextField(**_tf_ai_args, suffix=ai_cam_btn)  # icono dentro del recuadro
+            ai_input = tf_ai
+        except TypeError:  # versión de Flet sin 'suffix': el icono va al lado
+            tf_ai = ft.TextField(**_tf_ai_args, expand=True)
+            ai_input = ft.Row([tf_ai, ai_cam_btn], vertical_alignment=ft.CrossAxisAlignment.START)
+        ai_photo_box = ft.Container(visible=False)
+        ai_camera_holder = ft.Container(visible=False)
         ai_loading_txt = ft.Text("Pensando…", size=13, color="#77736A")
         ai_loading = ft.Row(
             [ft.ProgressRing(width=18, height=18, stroke_width=3), ai_loading_txt],
@@ -2751,6 +2818,112 @@ def main(page: ft.Page):
             render_ai_items()
             page.update()
 
+        def clear_ai_photo(e=None):
+            ai_state["photo"] = None
+            ai_photo_box.visible = False
+            ai_photo_box.content = None
+            page.update()
+
+        def set_ai_photo(jpeg_bytes):
+            ai_state["photo"] = jpeg_bytes
+            thumb = ft.Image(
+                src=base64.b64encode(jpeg_bytes).decode("ascii"),
+                width=84, height=84, fit=ft.BoxFit.COVER, border_radius=10,
+                error_content=ft.Icon(ft.Icons.IMAGE_OUTLINED, size=32, color="#A9A59B"),
+            )
+            ai_photo_box.content = ft.Container(
+                bgcolor="#ffffff", border_radius=10, padding=10, border=CARD_BORDER,
+                content=ft.Row(
+                    [
+                        thumb,
+                        ft.Column(
+                            [
+                                ft.Text("Foto lista", size=14, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                                ft.Text(
+                                    "Puedes añadir texto para aclarar ingredientes, o calcular solo con la foto.",
+                                    size=11, color="#77736A",
+                                ),
+                            ],
+                            spacing=2, expand=True,
+                        ),
+                        ft.IconButton(
+                            icon=ft.Icons.CLOSE, icon_color="#B8453A",
+                            tooltip="Quitar foto", on_click=clear_ai_photo,
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+            )
+            ai_photo_box.visible = True
+            page.update()
+
+        def close_ai_camera(e=None):
+            ai_camera_holder.visible = False
+            ai_camera_holder.content = None
+            page.update()
+
+        async def open_ai_camera(e=None):
+            try:
+                cam = fc.Camera(expand=True, preview_enabled=True)
+            except Exception as ex:
+                notify(f"Cámara no disponible: {ex}", "#B8453A")
+                return
+
+            async def snap(ev=None):
+                try:
+                    data = await cam.take_picture()
+                except Exception as ex:
+                    notify(f"No se pudo hacer la foto: {ex}", "#B8453A")
+                    return
+                if not data:
+                    notify("No se obtuvo la foto, inténtalo otra vez", "#B8453A")
+                    return
+                close_ai_camera()
+                set_ai_photo(await asyncio.to_thread(prepare_photo, data))
+
+            ai_camera_holder.content = ft.Container(
+                bgcolor="#ffffff", padding=14, border_radius=12, border=CARD_BORDER,
+                content=ft.Column(
+                    [
+                        ft.Container(
+                            height=320, border_radius=10, bgcolor="#1C1B18",
+                            clip_behavior=ft.ClipBehavior.HARD_EDGE, content=cam,
+                        ),
+                        ft.Text("Encuadra el plato entero, con buena luz.", size=12, color="#77736A"),
+                        ft.Row(
+                            [
+                                make_button("📸 Hacer foto", "#24543F", snap, expand=True),
+                                make_button("✖ Cerrar", "#B8453A", close_ai_camera, expand=True),
+                            ],
+                            spacing=8,
+                        ),
+                    ],
+                    spacing=10,
+                ),
+            )
+            ai_camera_holder.visible = True
+            page.update()
+            try:
+                cameras = await cam.get_available_cameras()
+                if not cameras:
+                    notify("No se encontró ninguna cámara", "#B8453A")
+                    close_ai_camera()
+                    return
+                chosen = next(
+                    (c for c in cameras if c.lens_direction == fc.CameraLensDirection.BACK),
+                    cameras[0],
+                )
+                await cam.initialize(
+                    description=chosen,
+                    resolution_preset=fc.ResolutionPreset.HIGH,
+                    enable_audio=False,
+                )
+            except Exception as ex:
+                notify(f"No se pudo abrir la cámara: {ex}", "#B8453A")
+                close_ai_camera()
+
+        ai_cam_btn.on_click = open_ai_camera
+
         def discard_ai(e=None):
             ai_state["items"] = []
             render_ai_items()
@@ -2769,6 +2942,9 @@ def main(page: ft.Page):
                 extra = " y guardada como fija"
             ai_state["items"] = []
             tf_ai.value = ""
+            ai_state["photo"] = None
+            ai_photo_box.visible = False
+            ai_photo_box.content = None
             render_ai_items()
             notify(f"{len(items)} alimento(s) añadidos a {meal_dest}{extra}", "#3F7D58")
             switch_tab(0)
@@ -2817,12 +2993,14 @@ def main(page: ft.Page):
 
         async def analyze_text(e=None):
             text = (tf_ai.value or "").strip()
-            if not text:
-                notify("Escribe o dicta lo que has comido", "#B8453A")
+            photo = ai_state.get("photo")
+            if not text and not photo:
+                notify("Escribe lo que has comido o haz una foto", "#B8453A")
                 return
-            set_busy(True, "Calculando pesos y macros…")
+            close_ai_camera()
+            set_busy(True, "Analizando la foto y calculando macros…" if photo else "Calculando pesos y macros…")
             try:
-                ai_state["items"] = await asyncio.to_thread(ai_parse_foods, text)
+                ai_state["items"] = await asyncio.to_thread(ai_parse_foods, text, photo)
             except Exception as ex:
                 set_busy(False)
                 notify(f"IA: {ex}", "#B8453A")
@@ -3073,11 +3251,20 @@ def main(page: ft.Page):
             content=ft.Column(
                 [
                     ft.Text("Asistente", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
-                    ft.Text("Escribe o dicta lo que has comido. Estimo pesos y macros.", size=13, color="#77736A"),
+                    ft.Text(
+                        "Escribe, dicta o haz una foto de lo que has comido. Estimo pesos y macros.",
+                        size=13, color="#77736A",
+                    ),
                     ft.Text("Se registrará en:", size=12, weight=ft.FontWeight.W_600, color="#77736A"),
                     ai_meal_row,
-                    tf_ai,
-                    ft.Text("Para dictar, usa el micrófono del teclado.", size=11, color="#A9A59B"),
+                    ai_input,
+                    ai_camera_holder,
+                    ai_photo_box,
+                    ft.Text(
+                        "Para dictar, usa el micrófono del teclado. La cámara 📷 del recuadro analiza un plato; "
+                        "el texto sirve para aclarar lo que no se ve.",
+                        size=11, color="#A9A59B",
+                    ),
                     make_button("✨ Calcular macros", "#1C1B18", analyze_text),
                     ai_loading,
                     ai_result_col,
@@ -3575,6 +3762,8 @@ def main(page: ft.Page):
             nav_bar.selected_index = index
             if index != 3 and scan_state["active"]:
                 close_camera_inline()
+            if index != 2 and ai_camera_holder.visible:
+                close_ai_camera()
             if index == 0:
                 refresh_dashboard()
             elif index == 1:
