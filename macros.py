@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 import cv2
 import numpy as np
 import flet as ft
@@ -112,6 +113,12 @@ class DatabaseManager:
             self.cursor.execute("ALTER TABLE food_log ADD COLUMN image TEXT")
         except Exception:
             pass
+        # Alimentos añadidos como conjunto (Mis comidas): comparten group_id y group_name
+        for _col in ("group_id TEXT", "group_name TEXT"):
+            try:
+                self.cursor.execute(f"ALTER TABLE food_log ADD COLUMN {_col}")
+            except Exception:
+                pass
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS saved_meals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -268,22 +275,26 @@ class DatabaseManager:
         )
         self.conn.commit()
 
-    def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None):
+    def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None,
+                 group_id=None, group_name=None):
         self.cursor.execute(
             """
-            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image, date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image, date,
+                                  group_id, group_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-            (user_id, meal_type, name, grams, kcal, p, c, f, image, today_str()),
+            (user_id, meal_type, name, grams, kcal, p, c, f, image, today_str(), group_id, group_name),
         )
         self.conn.commit()
 
     def get_today_foods(self, user_id):
         self.cursor.execute(
             """
-            SELECT id, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image
+            SELECT id, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image,
+                   group_id, group_name
             FROM food_log
             WHERE user_id = ? AND date = ?
+            ORDER BY id ASC
         """,
             (user_id, today_str()),
         )
@@ -321,7 +332,8 @@ class DatabaseManager:
         """Alimentos entre dos fechas (YYYY-MM-DD, ambas incluidas)."""
         self.cursor.execute(
             """
-            SELECT id, date, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image
+            SELECT id, date, COALESCE(meal_type, 'Almuerzo'), name, grams, kcal, p, c, f, image,
+                   group_id, group_name
             FROM food_log
             WHERE user_id = ? AND date BETWEEN ? AND ?
             ORDER BY date ASC, id ASC
@@ -329,6 +341,20 @@ class DatabaseManager:
             (user_id, start, end),
         )
         return self.cursor.fetchall()
+
+    def delete_group(self, user_id, group_id):
+        self.cursor.execute(
+            "DELETE FROM food_log WHERE user_id = ? AND group_id = ?", (user_id, group_id)
+        )
+        self.conn.commit()
+
+    def delete_meal_today(self, user_id, meal_type):
+        """Borra todos los alimentos de hoy de una comida (desayuno, almuerzo…)."""
+        self.cursor.execute(
+            "DELETE FROM food_log WHERE user_id = ? AND date = ? AND COALESCE(meal_type, 'Almuerzo') = ?",
+            (user_id, today_str(), meal_type),
+        )
+        self.conn.commit()
 
     def delete_food(self, food_id):
         self.cursor.execute("DELETE FROM food_log WHERE id = ?", (food_id,))
@@ -672,6 +698,52 @@ def ai_parse_foods(description, image_bytes=None):
             else "No pude identificar alimentos. Prueba a describirlo de otra forma."
         )
     return items
+
+
+DAY_REVIEW_PROMPT = (
+    "Eres un nutricionista deportivo cercano y honesto. Valoras UN día de comidas de un usuario que "
+    "cuenta macros con fines de fitness. Recibes su objetivo, lo consumido y cada alimento con sus "
+    "gramos. Sé FLEXIBLE y proporcionado: un capricho pequeño (una ración normal de dulce, snack o "
+    "procesado, aprox. por debajo del 10-15 % de las kcal del día) NO es un problema y no lo señales; "
+    "tampoco regañes por un día imperfecto. Solo marca un alimento cuando la CANTIDAD sea claramente "
+    "excesiva (por ejemplo 300 g de sobrasada, medio kilo de embutido, litros de refresco, bollería "
+    "abundante, mucho alcohol) o cuando el conjunto del día sea claramente pobre (casi todo "
+    "ultraprocesado, sin verdura, fruta ni proteína de calidad). Para cada problema real: di qué "
+    "cantidad sería razonable (en gramos) y da 2-3 alternativas saludables concretas y realistas que "
+    "se parezcan en sabor o uso. Si el día fue bueno, dilo con claridad y con un detalle concreto "
+    "(proteína, fibra, variedad…). Si el día está incompleto, no juzgues lo que aún falta por comer. "
+    'Devuelve SOLO un JSON: {"verdict":"muy_bien|bien|mejorable|mal","title":"frase corta",'
+    '"summary":"2-3 frases","flags":[{"food":"nombre","issue":"por qué, 1 frase",'
+    '"suggested_grams":0,"alternatives":["...","..."]}],"tips":["consejo corto"]}. Reglas: flags vacío '
+    "si no hay nada grave; máximo 3 flags y 2 tips; todo en español, tono cercano, sin sermones ni "
+    "culpa; no inventes alimentos que no estén en la lista; kcal y gramos solo como referencia."
+)
+
+
+def ai_review_day(context):
+    data = extract_json(ask_ai(DAY_REVIEW_PROMPT, context, max_tokens=1400))
+    verdict = str(data.get("verdict", "bien")).lower().strip()
+    if verdict not in ("muy_bien", "bien", "mejorable", "mal"):
+        verdict = "bien"
+    flags = []
+    for fl in (data.get("flags") or [])[:3]:
+        if not isinstance(fl, dict):
+            continue
+        food = str(fl.get("food", "")).strip()
+        issue = str(fl.get("issue", "")).strip()
+        alts = [str(a).strip() for a in (fl.get("alternatives") or []) if str(a).strip()][:3]
+        if food and (issue or alts):
+            flags.append(
+                {"food": food, "issue": issue, "grams": round(_num(fl.get("suggested_grams"))), "alternatives": alts}
+            )
+    tips = [str(t).strip() for t in (data.get("tips") or []) if str(t).strip()][:2]
+    return {
+        "verdict": verdict,
+        "title": str(data.get("title", "")).strip(),
+        "summary": str(data.get("summary", "")).strip(),
+        "flags": flags,
+        "tips": tips,
+    }
 
 
 def ai_estimate_activity(text, weight, height, age, gender):
@@ -1318,6 +1390,7 @@ def main(page: ft.Page):
     on_new_day = [None]  # callback que se ejecuta cuando cambia el día (00:00)
     selected_meal_for_add = ["Desayuno"]
     expanded_meal = [None]
+    expanded_groups = set()  # ids de grupos (Mis comidas) con el desglose abierto en Hoy
 
     MEALS_META = {
         "Desayuno": {"icon": ft.Icons.FREE_BREAKFAST_OUTLINED, "ratio": 0.30},
@@ -2367,6 +2440,38 @@ def main(page: ft.Page):
             refresh_dashboard()
             notify("Alimento eliminado", "#B8453A")
 
+        def toggle_group(gid):
+            if gid in expanded_groups:
+                expanded_groups.discard(gid)
+            else:
+                expanded_groups.add(gid)
+            refresh_dashboard()
+
+        def delete_group_item(gid):
+            db.delete_group(current_user_id[0], gid)
+            expanded_groups.discard(gid)
+            refresh_dashboard()
+            notify("Comida eliminada", "#B8453A")
+
+        def confirm_delete_meal(meal_name):
+            def do_delete(e):
+                db.delete_meal_today(current_user_id[0], meal_name)
+                page.pop_dialog()
+                refresh_dashboard()
+                notify(f"{meal_name} de hoy vaciado", "#B8453A")
+
+            page.show_dialog(
+                ft.AlertDialog(
+                    modal=True,
+                    title=ft.Text(f"¿Borrar todo de {meal_name}?"),
+                    content=ft.Text("Se eliminarán todos los alimentos de hoy en esta comida. No se puede deshacer."),
+                    actions=[
+                        ft.TextButton("Cancelar", on_click=lambda e: page.pop_dialog()),
+                        ft.TextButton("Borrar todo", on_click=do_delete),
+                    ],
+                )
+            )
+
         def refresh_dashboard():
             u = db.get_user(current_user_id[0])
             if not u:
@@ -2390,6 +2495,19 @@ def main(page: ft.Page):
             suggest_btn.visible = rem_kcal >= 60
             lbl_remaining.value = f"{rem_kcal:,}".replace(",", ".")
             ring_main.value = min(1.0, skcal / max(1.0, tkcal))
+
+            # Valoración con IA: automática al llegar a las calorías del día, manual cuando quieras
+            day_review["cur_sig"] = tuple(x[0] for x in foods)
+            eval_btn.visible = bool(foods)
+            render_review()
+            if (
+                foods
+                and rem_kcal < 60
+                and not day_review["busy"]
+                and day_review["sig"] != day_review["cur_sig"]
+                and day_review["fail_sig"] != day_review["cur_sig"]
+            ):
+                page.run_task(run_day_review, True)
 
             lbl_c.value = f"{int(sc)} / {int(tc)}g"
             bar_c.value = min(1.0, sc / max(1.0, tc))
@@ -2490,7 +2608,93 @@ def main(page: ft.Page):
                             )
                         )
                     else:
-                        for fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg in m_foods:
+                        done_groups = set()
+                        for r in m_foods:
+                            fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg, gid, gname = r
+                            if gid:
+                                # Conjunto de «Mis comidas»: una sola fila; al pulsar se ve el desglose
+                                if gid in done_groups:
+                                    continue
+                                done_groups.add(gid)
+                                members = [x for x in m_foods if x[9] == gid]
+                                gk = sum(x[4] for x in members)
+                                gp = sum(x[5] for x in members)
+                                gc = sum(x[6] for x in members)
+                                gf = sum(x[7] for x in members)
+                                g_open = gid in expanded_groups
+                                meals_card_col.controls.append(
+                                    ft.Container(
+                                        bgcolor="#FAF8F4",
+                                        padding=10,
+                                        on_click=lambda e, g=gid: toggle_group(g),
+                                        content=ft.Row(
+                                            [
+                                                ft.Container(
+                                                    width=38, height=38, border_radius=10, bgcolor="#E3ECE6",
+                                                    alignment=ft.Alignment.CENTER,
+                                                    content=ft.Icon(ft.Icons.RESTAURANT_MENU, size=18, color="#24543F"),
+                                                ),
+                                                ft.Column(
+                                                    [
+                                                        ft.Text(
+                                                            f"• {gname}", size=13,
+                                                            weight=ft.FontWeight.W_600, color="#3A3832",
+                                                        ),
+                                                        ft.Text(
+                                                            f"{len(members)} alimentos • {int(gk)} kcal | "
+                                                            f"C: {gc:.1f}g • P: {gp:.1f}g • G: {gf:.1f}g",
+                                                            size=11, color="#77736A",
+                                                        ),
+                                                    ],
+                                                    spacing=1, expand=True,
+                                                ),
+                                                ft.Icon(
+                                                    ft.Icons.EXPAND_LESS if g_open else ft.Icons.EXPAND_MORE,
+                                                    size=20, color="#A9A59B",
+                                                ),
+                                                ft.Container(
+                                                    padding=6,
+                                                    tooltip="Quitar toda la comida",
+                                                    on_click=lambda e, g=gid: delete_group_item(g),
+                                                    content=ft.Icon(ft.Icons.CLOSE, size=18, color="#B8453A"),
+                                                ),
+                                            ],
+                                            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                        ),
+                                    )
+                                )
+                                if g_open:
+                                    for x in members:
+                                        meals_card_col.controls.append(
+                                            ft.Container(
+                                                bgcolor="#F4F1EA",
+                                                padding=ft.Padding(left=30, right=10, top=7, bottom=7),
+                                                content=ft.Row(
+                                                    [
+                                                        ft.Column(
+                                                            [
+                                                                ft.Text(
+                                                                    f"– {x[2]} ({int(x[3])}g)", size=12,
+                                                                    weight=ft.FontWeight.W_600, color="#3A3832",
+                                                                ),
+                                                                ft.Text(
+                                                                    f"{int(x[4])} kcal | C: {x[6]:.1f}g • P: {x[5]:.1f}g • G: {x[7]:.1f}g",
+                                                                    size=11, color="#77736A",
+                                                                ),
+                                                            ],
+                                                            spacing=1, expand=True,
+                                                        ),
+                                                        ft.Container(
+                                                            padding=4,
+                                                            on_click=lambda e, i=x[0]: delete_food_item(i),
+                                                            content=ft.Icon(ft.Icons.CLOSE, size=16, color="#B8453A"),
+                                                        ),
+                                                    ],
+                                                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                                                ),
+                                            )
+                                        )
+                                continue
                             meals_card_col.controls.append(
                                 ft.Container(
                                     bgcolor="#FAF8F4",
@@ -2517,15 +2721,38 @@ def main(page: ft.Page):
                                             ),
                                             ft.Container(
                                                 padding=6,
-                                                on_click=lambda e, i=fid: delete_food_item(
-                                                    i
-                                                ),
+                                                on_click=lambda e, i=fid: delete_food_item(i),
                                                 content=ft.Icon(ft.Icons.CLOSE, size=18, color="#B8453A"),
                                             ),
                                         ]
                                     ),
                                 )
                             )
+                        meals_card_col.controls.append(
+                            ft.Container(
+                                bgcolor="#FAF8F4",
+                                padding=ft.Padding(left=10, right=10, top=4, bottom=10),
+                                content=ft.Row(
+                                    [
+                                        ft.Container(
+                                            padding=ft.Padding(left=10, right=10, top=6, bottom=6),
+                                            border_radius=8, bgcolor="#F6E4E1",
+                                            on_click=lambda e, mn=m_name: confirm_delete_meal(mn),
+                                            content=ft.Row(
+                                                [
+                                                    ft.Icon(ft.Icons.DELETE_OUTLINE, size=16, color="#B8453A"),
+                                                    ft.Text(
+                                                        f"Borrar todo de {m_name}", size=12,
+                                                        weight=ft.FontWeight.W_600, color="#B8453A",
+                                                    ),
+                                                ],
+                                                spacing=5, tight=True,
+                                            ),
+                                        )
+                                    ]
+                                ),
+                            )
+                        )
 
                 if idx < len(meal_names) - 1:
                     meals_card_col.controls.append(
@@ -2557,6 +2784,129 @@ def main(page: ft.Page):
 
         async def _go_sugg(e):
             await go_suggestions(e)
+
+        # ----- VALORACIÓN DEL DÍA CON IA -----
+        day_review = {"sig": None, "cur_sig": None, "data": None, "busy": False, "fail_sig": None}
+        review_card = ft.Container(visible=False)
+        review_loading = ft.Row(
+            [ft.ProgressRing(width=18, height=18, stroke_width=3), ft.Text("Valorando tu día…", size=13, color="#77736A")],
+            visible=False,
+        )
+        _warn_icon = getattr(ft.Icons, "WARNING_AMBER_ROUNDED", ft.Icons.LIGHTBULB_OUTLINE)
+        VERDICT_STYLE = {
+            "muy_bien": ("¡Muy bien!", "#3F7D58", ft.Icons.CHECK),
+            "bien": ("Bien", "#3F7D58", ft.Icons.CHECK),
+            "mejorable": ("Se puede mejorar", "#D9A441", ft.Icons.LIGHTBULB_OUTLINE),
+            "mal": ("Ojo con esto", "#C9763F", _warn_icon),
+        }
+
+        def build_day_context(u, foods):
+            tk, tp_, tc_, tf_ = u[10], u[11], u[12], u[13]
+            lines = [
+                f"Objetivo del usuario: {u[8]} (ajuste {u[9]:+.0f} kcal). Peso: {u[3]} kg.",
+                f"Objetivo diario: {int(tk)} kcal, P {int(tp_)} g, C {int(tc_)} g, G {int(tf_)} g.",
+                f"Consumido hoy: {int(sum(x[4] for x in foods))} kcal, P {int(sum(x[5] for x in foods))} g, "
+                f"C {int(sum(x[6] for x in foods))} g, G {int(sum(x[7] for x in foods))} g.",
+                "Alimentos de hoy:",
+            ]
+            for m in MEALS_META:
+                items = [x for x in foods if x[1] == m]
+                if items:
+                    lines.append(
+                        f"{m}: "
+                        + "; ".join(
+                            f"{x[2]} {int(x[3])} g ({int(x[4])} kcal, P {x[5]:.0f}, C {x[6]:.0f}, G {x[7]:.0f})"
+                            for x in items
+                        )
+                    )
+            return "\n".join(lines)
+
+        def render_review():
+            d = day_review["data"]
+            if not d or day_review["sig"] != day_review["cur_sig"]:
+                review_card.visible = False
+                review_card.content = None
+                return
+            label, color, icon = VERDICT_STYLE[d["verdict"]]
+            body = [
+                ft.Row(
+                    [
+                        ft.Container(
+                            width=38, height=38, border_radius=19, bgcolor=color, alignment=ft.Alignment.CENTER,
+                            content=ft.Icon(icon, size=20, color="white"),
+                        ),
+                        ft.Column(
+                            [
+                                ft.Text(label.upper(), size=11, weight=ft.FontWeight.W_600, color=color),
+                                ft.Text(d["title"] or "Valoración del día", size=15,
+                                        weight=ft.FontWeight.W_600, color="#1C1B18"),
+                            ],
+                            spacing=1, expand=True,
+                        ),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                ),
+                ft.Text(d["summary"], size=13, color="#3A3832"),
+            ]
+            for fl in d["flags"]:
+                lines = [ft.Text(fl["food"], size=13, weight=ft.FontWeight.W_600, color="#1C1B18")]
+                if fl["issue"]:
+                    lines.append(ft.Text(fl["issue"], size=12, color="#3A3832"))
+                if fl["grams"] > 0:
+                    lines.append(
+                        ft.Text(f"Cantidad más razonable: ~{fl['grams']} g", size=12,
+                                weight=ft.FontWeight.W_600, color="#C9763F")
+                    )
+                if fl["alternatives"]:
+                    lines.append(
+                        ft.Text("Alternativas: " + ", ".join(fl["alternatives"]), size=12, color="#24543F")
+                    )
+                body.append(
+                    ft.Container(bgcolor="#FFF6EC", border_radius=10, padding=10, content=ft.Column(lines, spacing=3))
+                )
+            for t in d["tips"]:
+                body.append(ft.Text("• " + t, size=12, color="#3A3832"))
+            body.append(
+                ft.Text("Valoración orientativa de la IA; no sustituye a un dietista.", size=10, color="#A9A59B")
+            )
+            review_card.content = ft.Container(
+                bgcolor="#ffffff", border_radius=14, padding=16, border=CARD_BORDER,
+                content=ft.Column(body, spacing=8),
+            )
+            review_card.visible = True
+
+        async def run_day_review(auto=False):
+            if day_review["busy"]:
+                return
+            u = db.get_user(current_user_id[0])
+            foods = db.get_today_foods(current_user_id[0])
+            if not u or not foods:
+                if not auto:
+                    notify("Registra algo primero para poder valorar el día", "#B8453A")
+                return
+            sig = tuple(x[0] for x in foods)
+            day_review["busy"] = True
+            review_loading.visible = True
+            page.update()
+            try:
+                data = await asyncio.to_thread(ai_review_day, build_day_context(u, foods))
+            except Exception as ex:
+                day_review["busy"] = False
+                day_review["fail_sig"] = sig  # no reintentar solo en bucle
+                review_loading.visible = False
+                page.update()
+                if not auto:
+                    notify(f"IA: {ex}", "#B8453A")
+                return
+            day_review.update(sig=sig, data=data, busy=False)
+            review_loading.visible = False
+            render_review()
+            page.update()
+
+        async def _review_click(e):
+            await run_day_review(False)
+
+        eval_btn = make_button("✨ Valorar mi día con IA", "#24543F", _review_click)
 
         suggest_btn = make_button(
             "💡 Plan de recetas para llegar a mis calorías", "#1C1B18", _go_sugg
@@ -2628,6 +2978,9 @@ def main(page: ft.Page):
                         ),
                     ),
                     suggest_btn,
+                    eval_btn,
+                    review_loading,
+                    review_card,
                     ft.Container(
                         bgcolor="#ffffff",
                         border_radius=14,
@@ -2644,8 +2997,26 @@ def main(page: ft.Page):
 
         # ----- CAPA 2: AÑADIR ALIMENTO -----
         meal_selector_row = ft.Row(spacing=6, wrap=True)
+        lbl_meal_dest = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#77736A")
+
+        def default_meal_for_now():
+            """Comida que toca según la hora (hora de España): así no se apunta todo al desayuno."""
+            now = now_local()
+            h = now.hour + now.minute / 60.0
+            if h < 5:
+                return "Cena"
+            if h < 11.5:
+                return "Desayuno"
+            if h < 16.5:
+                return "Almuerzo"
+            if h < 19.5:
+                return "Snacks"
+            return "Cena"
+
+        selected_meal_for_add[0] = default_meal_for_now()
 
         def render_meal_selector_pills():
+            lbl_meal_dest.value = f"Se registrará en: {selected_meal_for_add[0]}  (toca otra para cambiar)"
             meal_selector_row.controls.clear()
             for m_name, meta in MEALS_META.items():
                 active = selected_meal_for_add[0] == m_name
@@ -2910,11 +3281,19 @@ def main(page: ft.Page):
         saved_col = ft.Column(spacing=8)
         mm_state = {"items": []}
 
-        def add_items_to_log(items, meal_dest):
+        def add_items_to_log(items, meal_dest, group_name=None):
+            """Añade alimentos a una comida. Con group_name (o gname en cada alimento) entran como
+            un conjunto con ese nombre, con desglose al pulsarlo en Hoy."""
+            gids = {}
             for it in items:
+                gname = group_name or it.get("gname")
+                gid = None
+                if gname:
+                    gid = gids.setdefault(it.get("gkey") or "_", uuid.uuid4().hex[:12])
                 db.add_food(
                     current_user_id[0], meal_dest, it["name"], it["grams"],
                     it["kcal"], it["p"], it["c"], it["f"], it.get("image"),
+                    group_id=gid, group_name=gname,
                 )
             expanded_meal[0] = meal_dest
 
@@ -2952,7 +3331,7 @@ def main(page: ft.Page):
             for s_id, sname, _, items in db.get_saved_meals(current_user_id[0]):
                 if s_id == sid:
                     meal_dest = selected_meal_for_add[0]
-                    add_items_to_log(items, meal_dest)
+                    add_items_to_log(items, meal_dest, group_name=sname)
                     notify(f"'{sname}' añadida a {meal_dest}", "#3F7D58")
                     switch_tab(0)
                     return
@@ -3210,6 +3589,7 @@ def main(page: ft.Page):
             content=ft.Column(
                 [
                     ft.Text("Añadir alimento", size=24, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                    lbl_meal_dest,
                     meal_selector_row,
                     ft.Row(
                         [
@@ -4090,7 +4470,8 @@ def main(page: ft.Page):
 
         def hist_items(m_foods):
             return [
-                {"name": x[3], "grams": x[4], "kcal": x[5], "p": x[6], "c": x[7], "f": x[8], "image": x[9]}
+                {"name": x[3], "grams": x[4], "kcal": x[5], "p": x[6], "c": x[7], "f": x[8], "image": x[9],
+                 "gname": x[11], "gkey": x[10]}
                 for x in m_foods
             ]
 
