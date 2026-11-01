@@ -47,15 +47,41 @@ def date_es_short(d):
     return f"{DIAS_ES[d.weekday()]} {d.day} {MESES_ES[d.month - 1][:3]}"
 
 
+try:
+    import libsql_experimental as libsql
+except ImportError:
+    libsql = None
+
+
 # ==========================================
-# BASE DE DATOS MULTIUSUARIO (SQLite)
+# BASE DE DATOS MULTIUSUARIO (SQLite + Turso)
 # ==========================================
 class DatabaseManager:
 
     def __init__(self, db_name="gym_macros_mobile.db"):
-        self.conn = sqlite3.connect(db_name, check_same_thread=False)
+        turso_url = os.getenv("TURSO_DATABASE_URL")
+        turso_token = os.getenv("TURSO_AUTH_TOKEN")
+
+        if libsql and turso_url and turso_token:
+            self.conn = libsql.connect(
+                database=db_name,
+                sync_url=turso_url,
+                auth_token=turso_token,
+            )
+            self.conn.sync()
+        else:
+            self.conn = sqlite3.connect(db_name, check_same_thread=False)
+
         self.cursor = self.conn.cursor()
         self.create_tables()
+
+    def _save(self):
+        self.conn.commit()
+        if hasattr(self.conn, "sync"):
+            try:
+                self.conn.sync()
+            except Exception as e:
+                print("Error sincronizando con Turso:", e)
 
     def create_tables(self):
         # Tabla de usuarios (Multiusuario)
@@ -137,7 +163,7 @@ class DatabaseManager:
                 self.cursor.execute(col_sql)
             except Exception:
                 pass
-        self.conn.commit()
+        self._save()
 
     def get_all_users(self):
         self.cursor.execute("""
@@ -204,7 +230,7 @@ class DatabaseManager:
                 burned_kcal,
             ),
         )
-        self.conn.commit()
+        self._save()
         return self.cursor.lastrowid
 
     def update_user(
@@ -250,13 +276,13 @@ class DatabaseManager:
                 user_id,
             ),
         )
-        self.conn.commit()
+        self._save()
 
     def delete_user(self, user_id):
         self.cursor.execute("DELETE FROM food_log WHERE user_id = ?", (user_id,))
         self.cursor.execute("DELETE FROM saved_meals WHERE user_id = ?", (user_id,))
         self.cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-        self.conn.commit()
+        self._save()
 
     def get_activity_extra(self, user_id):
         """Devuelve (texto de actividad, factor de actividad o None)."""
@@ -273,7 +299,7 @@ class DatabaseManager:
             "UPDATE users SET activity_text = ?, activity_mult = ? WHERE id = ?",
             (text or None, mult, user_id),
         )
-        self.conn.commit()
+        self._save()
 
     def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None,
                  group_id=None, group_name=None):
@@ -285,7 +311,7 @@ class DatabaseManager:
         """,
             (user_id, meal_type, name, grams, kcal, p, c, f, image, today_str(), group_id, group_name),
         )
-        self.conn.commit()
+        self._save()
 
     def get_today_foods(self, user_id):
         self.cursor.execute(
@@ -346,7 +372,7 @@ class DatabaseManager:
         self.cursor.execute(
             "DELETE FROM food_log WHERE user_id = ? AND group_id = ?", (user_id, group_id)
         )
-        self.conn.commit()
+        self._save()
 
     def delete_meal_today(self, user_id, meal_type):
         """Borra todos los alimentos de hoy de una comida (desayuno, almuerzo…)."""
@@ -354,11 +380,11 @@ class DatabaseManager:
             "DELETE FROM food_log WHERE user_id = ? AND date = ? AND COALESCE(meal_type, 'Almuerzo') = ?",
             (user_id, today_str(), meal_type),
         )
-        self.conn.commit()
+        self._save()
 
     def delete_food(self, food_id):
         self.cursor.execute("DELETE FROM food_log WHERE id = ?", (food_id,))
-        self.conn.commit()
+        self._save()
 
     # ----- Comidas fijas -----
     def save_meal(self, user_id, name, meal_type, items):
@@ -366,7 +392,7 @@ class DatabaseManager:
             "INSERT INTO saved_meals (user_id, name, meal_type, items) VALUES (?, ?, ?, ?)",
             (user_id, name, meal_type, json.dumps(items, ensure_ascii=False)),
         )
-        self.conn.commit()
+        self._save()
 
     def get_saved_meals(self, user_id):
         self.cursor.execute(
@@ -383,7 +409,7 @@ class DatabaseManager:
 
     def delete_saved_meal(self, saved_id):
         self.cursor.execute("DELETE FROM saved_meals WHERE id = ?", (saved_id,))
-        self.conn.commit()
+        self._save()
 
 
 # ==========================================
