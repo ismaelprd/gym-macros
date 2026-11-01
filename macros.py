@@ -1,5 +1,7 @@
 import asyncio
+import atexit
 import base64
+import functools
 import json
 import math
 import os
@@ -59,6 +61,8 @@ except ImportError:
 class DatabaseManager:
 
     def __init__(self, db_name="gym_macros_mobile.db"):
+        self._lock = threading.RLock()
+        self._sync_timer = None
         turso_url = os.getenv("TURSO_DATABASE_URL")
         turso_token = os.getenv("TURSO_AUTH_TOKEN")
 
@@ -75,13 +79,42 @@ class DatabaseManager:
         self.cursor = self.conn.cursor()
         self.create_tables()
 
-    def _save(self):
+    def _save(self, commit=True):
+        """Confirma el cambio al momento y sincroniza con Turso en segundo plano
+        (agrupando varias escrituras seguidas en una sola sincronización)."""
+        if not commit:
+            return
         self.conn.commit()
-        if hasattr(self.conn, "sync"):
+        self._schedule_sync()
+
+    def commit_now(self):
+        self._save()
+
+    def _schedule_sync(self, delay=1.0):
+        if not hasattr(self.conn, "sync"):
+            return
+        t = self._sync_timer
+        if t is not None:
+            t.cancel()
+        t = threading.Timer(delay, self._do_sync)
+        t.daemon = True
+        self._sync_timer = t
+        t.start()
+
+    def _do_sync(self):
+        with self._lock:
             try:
                 self.conn.sync()
             except Exception as e:
                 print("Error sincronizando con Turso:", e)
+
+    def flush(self):
+        """Sincroniza ya (se usa al apagar el servidor)."""
+        t = self._sync_timer
+        if t is not None:
+            t.cancel()
+        if hasattr(self.conn, "sync"):
+            self._do_sync()
 
     def create_tables(self):
         # Tabla de usuarios (Multiusuario)
@@ -302,7 +335,7 @@ class DatabaseManager:
         self._save()
 
     def add_food(self, user_id, meal_type, name, grams, kcal, p, c, f, image=None,
-                 group_id=None, group_name=None):
+                 group_id=None, group_name=None, commit=True):
         self.cursor.execute(
             """
             INSERT INTO food_log (user_id, meal_type, name, grams, kcal, p, c, f, image, date,
@@ -311,7 +344,7 @@ class DatabaseManager:
         """,
             (user_id, meal_type, name, grams, kcal, p, c, f, image, today_str(), group_id, group_name),
         )
-        self._save()
+        self._save(commit)
 
     def get_today_foods(self, user_id):
         self.cursor.execute(
@@ -410,6 +443,32 @@ class DatabaseManager:
     def delete_saved_meal(self, saved_id):
         self.cursor.execute("DELETE FROM saved_meals WHERE id = ?", (saved_id,))
         self._save()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *a, **k):
+        with self._lock:
+            return fn(self, *a, **k)
+    return wrapper
+
+
+for _n, _f in list(DatabaseManager.__dict__.items()):
+    if callable(_f) and not _n.startswith("__") and _n not in ("_schedule_sync", "_do_sync", "flush"):
+        setattr(DatabaseManager, _n, _locked(_f))
+
+_DB = None
+_DB_LOCK = threading.Lock()
+
+
+def get_db():
+    """Una única conexión compartida por todas las sesiones (antes se abría una por visita)."""
+    global _DB
+    with _DB_LOCK:
+        if _DB is None:
+            _DB = DatabaseManager(os.getenv("DB_PATH", "gym_macros_mobile.db"))
+            atexit.register(_DB.flush)
+        return _DB
 
 
 # ==========================================
@@ -1390,7 +1449,7 @@ def lookup_product(code):
 # APLICACIÓN MÓVIL MULTIUSUARIO
 # ==========================================
 def main(page: ft.Page):
-    db = DatabaseManager(os.getenv("DB_PATH", "gym_macros_mobile.db"))
+    db = get_db()
 
     page.title = "GymMacro"
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -3319,8 +3378,9 @@ def main(page: ft.Page):
                 db.add_food(
                     current_user_id[0], meal_dest, it["name"], it["grams"],
                     it["kcal"], it["p"], it["c"], it["f"], it.get("image"),
-                    group_id=gid, group_name=gname,
+                    group_id=gid, group_name=gname, commit=False,
                 )
+            db.commit_now()
             expanded_meal[0] = meal_dest
 
         def _mm_line(it):
