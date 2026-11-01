@@ -90,7 +90,7 @@ class DatabaseManager:
     def commit_now(self):
         self._save()
 
-    def _schedule_sync(self, delay=1.0):
+    def _schedule_sync(self, delay=2.0):
         if not hasattr(self.conn, "sync"):
             return
         t = self._sync_timer
@@ -196,7 +196,7 @@ class DatabaseManager:
                 self.cursor.execute(col_sql)
             except Exception:
                 pass
-        self._save()
+        self.conn.commit()  # sin sincronizar: ya se hizo al conectar y bloquearía la 1.ª pantalla
 
     def get_all_users(self):
         self.cursor.execute("""
