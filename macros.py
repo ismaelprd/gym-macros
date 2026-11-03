@@ -2640,9 +2640,10 @@ def main(page: ft.Page):
                 expanded_groups.add(gid)
             refresh_dashboard()
 
-        def delete_group_item(gid):
-            db.delete_group(current_user_id[0], gid)
-            expanded_groups.discard(gid)
+        def delete_group_item(gkey, gids):
+            for g_ in gids:
+                db.delete_group(current_user_id[0], g_)
+            expanded_groups.discard(gkey)
             refresh_dashboard()
             notify("Comida eliminada", "#B8453A")
 
@@ -2717,7 +2718,7 @@ def main(page: ft.Page):
             for idx, m_name in enumerate(meal_names):
                 meta = MEALS_META[m_name]
                 m_target = max(1, round(tkcal * meta["ratio"]))
-                m_foods = [f for f in foods if f[1] == m_name]
+                m_foods = [f for f in foods if canon_meal(f[1]) == m_name]
                 m_kcal = sum(f[4] for f in m_foods)
                 m_prog = min(1.0, m_kcal / m_target)
 
@@ -2806,20 +2807,23 @@ def main(page: ft.Page):
                             fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg, gid, gname = r
                             if gid:
                                 # Conjunto de «Mis comidas»: una sola fila; al pulsar se ve el desglose
-                                if gid in done_groups:
+                                # Un solo conjunto por nombre dentro de cada comida (evita filas repetidas)
+                                gkey = gname or gid
+                                if gkey in done_groups:
                                     continue
-                                done_groups.add(gid)
-                                members = [x for x in m_foods if x[9] == gid]
+                                done_groups.add(gkey)
+                                members = [x for x in m_foods if x[9] and (x[10] or x[9]) == gkey]
+                                gids_all = list(dict.fromkeys(x[9] for x in members))
                                 gk = sum(x[4] for x in members)
                                 gp = sum(x[5] for x in members)
                                 gc = sum(x[6] for x in members)
                                 gf = sum(x[7] for x in members)
-                                g_open = gid in expanded_groups
+                                g_open = gkey in expanded_groups
                                 meals_card_col.controls.append(
                                     ft.Container(
                                         bgcolor="#FAF8F4",
                                         padding=10,
-                                        on_click=lambda e, g=gid: toggle_group(g),
+                                        on_click=lambda e, g=gkey: toggle_group(g),
                                         content=ft.Row(
                                             [
                                                 ft.Container(
@@ -2848,7 +2852,7 @@ def main(page: ft.Page):
                                                 ft.Container(
                                                     padding=6,
                                                     tooltip="Quitar toda la comida",
-                                                    on_click=lambda e, g=gid: delete_group_item(g),
+                                                    on_click=lambda e, g=gkey, gs=gids_all: delete_group_item(g, gs),
                                                     content=ft.Icon(ft.Icons.CLOSE, size=18, color="#B8453A"),
                                                 ),
                                             ],
@@ -3472,12 +3476,16 @@ def main(page: ft.Page):
         def add_items_to_log(items, meal_dest, group_name=None):
             """Añade alimentos a una comida. Con group_name (o gname en cada alimento) entran como
             un conjunto con ese nombre, con desglose al pulsarlo en Hoy."""
+            meal_dest = canon_meal(meal_dest)  # solo existen Desayuno, Almuerzo, Cena y Snacks
             gids = {}
             for it in items:
                 gname = group_name or it.get("gname")
                 gid = None
                 if gname:
-                    gid = gids.setdefault(it.get("gkey") or "_", uuid.uuid4().hex[:12])
+                    # Con nombre de conjunto explícito (Mis comidas) todo entra en UN solo conjunto,
+                    # aunque los alimentos vinieran de varios conjuntos distintos.
+                    gk = "_" if group_name else (it.get("gkey") or "_")
+                    gid = gids.setdefault(gk, uuid.uuid4().hex[:12])
                 db.add_food(
                     current_user_id[0], meal_dest, it["name"], it["grams"],
                     it["kcal"], it["p"], it["c"], it["f"], it.get("image"),
@@ -4974,12 +4982,8 @@ def main(page: ft.Page):
                 )
                 card_items = [header]
                 if is_open and has:
-                    order = list(MEALS_META.keys())
-                    for r in by_day[iso]:
-                        if r[2] not in order:
-                            order.append(r[2])
-                    for m_name in order:
-                        m_foods = [r for r in by_day[iso] if r[2] == m_name]
+                    for m_name in MEALS_META:
+                        m_foods = [r for r in by_day[iso] if canon_meal(r[2]) == m_name]
                         if not m_foods:
                             continue
                         card_items.append(
@@ -5010,7 +5014,9 @@ def main(page: ft.Page):
                                                 hist_btn(
                                                     "Guardar en Mis comidas", ft.Icons.STAR_OUTLINE,
                                                     lambda e, mf=m_foods, mn=m_name, lb=label: save_fixed_dialog(
-                                                        hist_items(mf), f"{mn} ({lb})", mn
+                                                        hist_items(mf),
+                                                        (", ".join(x[3] for x in mf[:2]) or "Mi comida")[:40],
+                                                        canon_meal(mn),
                                                     ),
                                                 )
                                             ],
