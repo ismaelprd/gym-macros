@@ -1484,6 +1484,14 @@ def main(page: ft.Page):
         "Snacks": {"icon": ft.Icons.COOKIE_OUTLINED, "ratio": 0.05},
     }
 
+    def canon_meal(name):
+        """Devuelve el nombre de comida válido de Hoy (Desayuno, Almuerzo, Cena, Snacks)."""
+        n = (name or "").strip().lower()
+        for k in MEALS_META:
+            if k.lower() == n:
+                return k
+        return "Snacks"  # cualquier otro nombre se ve en Hoy como un snack
+
     # Banner de notificaciones flotante
     status_text = ft.Text("", color="white", size=13, weight=ft.FontWeight.W_600)
     status_banner = ft.Container(
@@ -3955,8 +3963,15 @@ def main(page: ft.Page):
             return rem, [x[2] for x in foods]
 
         # ----- PLAN DE RECETAS PARA LLEGAR EXACTO A LAS CALORÍAS -----
-        plan_state = {"n": 0, "plans": [], "targets": [], "rem": 0, "done": set(), "switches": {}}
+        plan_state = {
+            "n": 0, "plans": [], "targets": [], "rem": 0, "done": set(), "switches": {},
+            "mode": "day", "meal": "Desayuno",
+        }
         split_row = ft.Row(spacing=6, wrap=True)
+        split_label = ft.Text("Repartir en:", size=12, weight=ft.FontWeight.W_600, color="#77736A")
+        mode_row = ft.Row(spacing=6, wrap=True)
+        meal_pick_row = ft.Row(spacing=6, wrap=True, visible=False)
+        meal_info_txt = ft.Text("", size=12, color="#24543F", weight=ft.FontWeight.W_600, visible=False)
         tf_prefs = ft.TextField(
             label="Preferencias o alergias (opcional)",
             hint_text="Ej: sin lactosa, no me gusta el pescado, algo rápido",
@@ -3994,6 +4009,70 @@ def main(page: ft.Page):
                 )
 
         render_split_pills()
+
+        def meal_gap(foods, u, meal):
+            """kcal y macros que faltan para completar UNA comida (su parte del objetivo diario)."""
+            ratio = MEALS_META[meal]["ratio"]
+            mf = [f for f in foods if f[1] == meal]
+            return {
+                "target": round(u[10] * ratio),
+                "eaten": round(sum(f[4] for f in mf)),
+                "kcal": round(u[10] * ratio - sum(f[4] for f in mf)),
+                "p": max(0, round(u[11] * ratio - sum(f[5] for f in mf))),
+                "c": max(0, round(u[12] * ratio - sum(f[6] for f in mf))),
+                "f": max(0, round(u[13] * ratio - sum(f[7] for f in mf))),
+            }
+
+        def _pill(lbl, active, cb):
+            return ft.Container(
+                bgcolor="#24543F" if active else "#ffffff",
+                padding=10,
+                border_radius=10,
+                on_click=cb,
+                content=ft.Text(
+                    lbl, size=12, weight=ft.FontWeight.W_600,
+                    color="white" if active else "#77736A",
+                ),
+            )
+
+        def set_plan_mode(mode=None, meal=None):
+            if mode:
+                plan_state["mode"] = mode
+            if meal:
+                plan_state["meal"] = meal
+            render_plan_mode()
+            page.update()
+
+        def render_plan_mode():
+            """Pastillas «Todo el día / Una comida» y, en este último modo, la comida a completar."""
+            is_meal = plan_state["mode"] == "meal"
+            mode_row.controls = [
+                _pill("Todo el día", not is_meal, lambda e: set_plan_mode(mode="day")),
+                _pill("Completar una comida", is_meal, lambda e: set_plan_mode(mode="meal")),
+            ]
+            meal_pick_row.controls = [
+                _pill(m, plan_state["meal"] == m, lambda e, mm=m: set_plan_mode(meal=mm))
+                for m in MEALS_META
+            ]
+            meal_pick_row.visible = is_meal
+            meal_info_txt.visible = is_meal
+            split_row.visible = not is_meal
+            split_label.visible = not is_meal
+            if is_meal and current_user_id[0] is not None:
+                u = db.get_user(current_user_id[0])
+                if u:
+                    g = meal_gap(db.get_today_foods(current_user_id[0]), u, plan_state["meal"])
+                    if g["kcal"] >= 60:
+                        meal_info_txt.value = (
+                            f"{plan_state['meal']}: llevas {g['eaten']} de {g['target']} kcal "
+                            f"· te faltan {g['kcal']} kcal"
+                        )
+                    else:
+                        meal_info_txt.value = (
+                            f"{plan_state['meal']}: llevas {g['eaten']} de {g['target']} kcal · ya está completa"
+                        )
+
+        render_plan_mode()
 
         def pick_meal_slots(n, foods, tkcal):
             """Qué comidas del día rellenar: la elegida (1) o las que más les falta por cubrir."""
@@ -4057,7 +4136,11 @@ def main(page: ft.Page):
                     content=ft.Column(
                         [
                             ft.Text(
-                                f"Te quedan {R} kcal · plan de {n} comida{'s' if n > 1 else ''}",
+                                (
+                                    f"Te faltan {R} kcal para completar {targets[0]['meal']}"
+                                    if plan_state.get("mode") == "meal" and len(targets) == 1
+                                    else f"Te quedan {R} kcal · plan de {n} comida{'s' if n > 1 else ''}"
+                                ),
                                 size=13, weight=ft.FontWeight.W_600, color="white",
                             ),
                             ft.Text(
@@ -4146,25 +4229,43 @@ def main(page: ft.Page):
             u = db.get_user(current_user_id[0])
             foods = db.get_today_foods(current_user_id[0])
             rem, eaten = today_remaining()
-            R = int(round(rem["kcal"]))
-            if R < 60:
-                ai_suggest_col.controls = [
-                    ft.Text("Ya has llegado a tus calorías de hoy.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600)
+            if plan_state["mode"] == "meal":
+                # Completar SOLO una comida (desayuno, almuerzo, cena o snacks) hasta su objetivo
+                meal = plan_state["meal"]
+                g = meal_gap(foods, u, meal)
+                R = g["kcal"]
+                if R < 60:
+                    ai_suggest_col.controls = [
+                        ft.Text(
+                            f"{meal} ya está completo.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600
+                        )
+                    ]
+                    render_plan_mode()
+                    page.update()
+                    return
+                n = 1
+                kcals = [R]
+                targets = [{"meal": meal, "kcal": R, "p": g["p"], "c": g["c"], "f": g["f"]}]
+            else:
+                R = int(round(rem["kcal"]))
+                if R < 60:
+                    ai_suggest_col.controls = [
+                        ft.Text("Ya has llegado a tus calorías de hoy.", size=13, color="#3F7D58", weight=ft.FontWeight.W_600)
+                    ]
+                    page.update()
+                    return
+                # Si no cabe en una comida (> MAX_MEAL_KCAL) se reparte en varias; Auto decide cuántas.
+                n = plan_state["n"] or math.ceil(R / MAX_MEAL_KCAL)
+                n = max(1, min(4, n, R // MIN_MEAL_KCAL))
+                slots = pick_meal_slots(n, foods, u[10])
+                kcals = split_calories(R, n)
+                targets = [
+                    {
+                        "meal": slots[i], "kcal": kcals[i],
+                        "p": round(rem["p"] / n), "c": round(rem["c"] / n), "f": round(rem["f"] / n),
+                    }
+                    for i in range(n)
                 ]
-                page.update()
-                return
-            # Si no cabe en una comida (> MAX_MEAL_KCAL) se reparte en varias; Auto decide cuántas.
-            n = plan_state["n"] or math.ceil(R / MAX_MEAL_KCAL)
-            n = max(1, min(4, n, R // MIN_MEAL_KCAL))
-            slots = pick_meal_slots(n, foods, u[10])
-            kcals = split_calories(R, n)
-            targets = [
-                {
-                    "meal": slots[i], "kcal": kcals[i],
-                    "p": round(rem["p"] / n), "c": round(rem["c"] / n), "f": round(rem["f"] / n),
-                }
-                for i in range(n)
-            ]
             set_plan_busy(True, f"Creando {n} receta{'s' if n > 1 else ''} de ~{kcals[0]} kcal…")
             try:
                 plans = await asyncio.to_thread(ai_plan, targets, eaten, (tf_prefs.value or "").strip())
@@ -4174,6 +4275,7 @@ def main(page: ft.Page):
                 return
             plan_state.update(plans=plans, targets=targets, rem=R, done=set())
             render_plan()
+            render_plan_mode()
             set_plan_busy(False)
 
         async def go_suggestions(e=None):
@@ -4207,10 +4309,15 @@ def main(page: ft.Page):
                     ft.Text("Completar el día", size=18, weight=ft.FontWeight.W_600, color="#1C1B18"),
                     ft.Text(
                         f"Te creo recetas para llegar justo a tus calorías de hoy (±{PLAN_TOLERANCE} kcal por comida). "
-                        "Si son demasiadas para una sola comida, las reparto en varias.",
+                        "Si son demasiadas para una sola comida, las reparto en varias. "
+                        "O elige «Completar una comida» para rellenar solo lo que te falta de un desayuno, "
+                        "almuerzo, cena o snack.",
                         size=12, color="#77736A",
                     ),
-                    ft.Text("Repartir en:", size=12, weight=ft.FontWeight.W_600, color="#77736A"),
+                    mode_row,
+                    meal_pick_row,
+                    meal_info_txt,
+                    split_label,
                     split_row,
                     tf_prefs,
                     make_button("Generar plan de recetas", "#24543F", run_suggestions),
@@ -4562,8 +4669,12 @@ def main(page: ft.Page):
             ]
 
         def copy_meal_to_today(m_foods, m_name, label):
-            add_items_to_log(hist_items(m_foods), m_name)
-            notify(f"{m_name} de «{label}» copiado a hoy", "#3F7D58")
+            # Va a la MISMA comida de hoy (el desayuno de ayer -> el desayuno de hoy) y cada
+            # alimento entra suelto: sin crear conjuntos/apartados nuevos.
+            dest = canon_meal(m_name)
+            items = [{**it, "gname": None, "gkey": None} for it in hist_items(m_foods)]
+            add_items_to_log(items, dest)
+            notify(f"{m_name} de «{label}» copiado a {dest} de hoy", "#3F7D58")
             refresh_history()
 
         def hist_btn(label, icon, cb):
@@ -4797,6 +4908,8 @@ def main(page: ft.Page):
             elif index == 1:
                 render_saved_meals()
                 render_recents(tf_search.value or "")
+            elif index == 2:
+                render_plan_mode()
             elif index == 4:
                 refresh_history()
             elif index == 5:
