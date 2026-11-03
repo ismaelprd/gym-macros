@@ -9,6 +9,7 @@ import re
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 import cv2
 import numpy as np
@@ -43,6 +44,31 @@ def today_str():
 
 def date_es_long(d):
     return f"{DIAS_ES[d.weekday()].capitalize()}, {d.day} de {MESES_ES[d.month - 1]} de {d.year}"
+
+
+DEFAULT_MEAL_SCHEDULE = {"b": "13:30", "l": "16:30", "s": "19:30"}
+# b = el desayuno llega hasta esa hora, l = el almuerzo, s = los snacks; después, cena.
+
+
+def parse_hhmm(txt):
+    """'13:30' -> 13.5 horas; None si no es una hora válida."""
+    m = re.fullmatch(r"\s*([01]?\d|2[0-3])\s*[:.hH]\s*([0-5]\d)\s*", str(txt or ""))
+    return int(m.group(1)) + int(m.group(2)) / 60.0 if m else None
+
+
+def meal_for_hour(h, schedule):
+    """Comida que toca a la hora `h` (en horas decimales) según el horario del usuario."""
+    sch = {**DEFAULT_MEAL_SCHEDULE, **(schedule or {})}
+    b, l, s_ = (parse_hhmm(sch[k]) for k in ("b", "l", "s"))
+    if None in (b, l, s_) or not b <= l <= s_:
+        b, l, s_ = (parse_hhmm(DEFAULT_MEAL_SCHEDULE[k]) for k in ("b", "l", "s"))
+    if h < b:
+        return "Desayuno"
+    if h < l:
+        return "Almuerzo"
+    if h < s_:
+        return "Snacks"
+    return "Cena"
 
 
 def date_es_short(d):
@@ -191,6 +217,7 @@ class DatabaseManager:
         for col_sql in (
             "ALTER TABLE users ADD COLUMN activity_text TEXT",
             "ALTER TABLE users ADD COLUMN activity_mult REAL",
+            "ALTER TABLE users ADD COLUMN meal_schedule TEXT",
         ):
             try:
                 self.cursor.execute(col_sql)
@@ -331,6 +358,24 @@ class DatabaseManager:
         self.cursor.execute(
             "UPDATE users SET activity_text = ?, activity_mult = ? WHERE id = ?",
             (text or None, mult, user_id),
+        )
+        self._save()
+
+    def get_meal_schedule(self, user_id):
+        """Horario de comidas del usuario ({'b','l','s'} con horas HH:MM) o el de por defecto."""
+        self.cursor.execute("SELECT meal_schedule FROM users WHERE id = ?", (user_id,))
+        row = self.cursor.fetchone()
+        sch = dict(DEFAULT_MEAL_SCHEDULE)
+        try:
+            sch.update(json.loads(row[0])) if row and row[0] else None
+        except Exception:
+            pass
+        return sch
+
+    def set_meal_schedule(self, user_id, schedule):
+        self.cursor.execute(
+            "UPDATE users SET meal_schedule = ? WHERE id = ?",
+            (json.dumps(schedule) if schedule else None, user_id),
         )
         self._save()
 
@@ -905,9 +950,41 @@ def _plan_from_ai(m, target):
     }
 
 
-def ai_plan(targets, eaten_names, prefs=""):
-    """Una receta por objetivo. Devuelve una lista (None donde no se pudo ajustar)."""
+def _norm_txt(t):
+    t = unicodedata.normalize("NFD", str(t or "").lower())
+    return "".join(ch for ch in t if unicodedata.category(ch) != "Mn").strip()
+
+
+def plan_avoid_terms(plan):
+    """Nombre del plato y sus ingredientes principales (para no repetirlos en la siguiente receta)."""
+    terms = [plan["title"]]
+    terms += [i["name"] for i in plan["ingredients"] if i["grams"] >= 40]
+    return terms
+
+
+def _plan_repeats(plan, avoid):
+    """True si el plato, o alguno de sus 3 ingredientes principales, ya salió antes."""
+    if not avoid:
+        return False
+    av = [_norm_txt(a) for a in avoid if a]
+    main = sorted(plan["ingredients"], key=lambda i: -i["grams"])[:3]
+    cands = [_norm_txt(plan["title"])] + [_norm_txt(i["name"]) for i in main if i["grams"] >= 40]
+    for c in cands:
+        for a in av:
+            if not c or not a:
+                continue
+            if c == a or (min(len(c), len(a)) >= 4 and (c in a or a in c)):
+                return True
+    return False
+
+
+def ai_plan(targets, eaten_names, prefs="", avoid=None):
+    """Una receta por objetivo. Devuelve una lista (None donde no se pudo ajustar).
+
+    `avoid`: platos e ingredientes de recetas anteriores que no deben repetirse."""
     plans = [None] * len(targets)
+    fallback = {}  # recetas válidas pero repetidas: solo se usan si no hay otra salida
+    repeated_last = False
     for attempt in range(2):
         pending = [i for i, p in enumerate(plans) if p is None]
         if not pending:
@@ -924,6 +1001,18 @@ def ai_plan(targets, eaten_names, prefs=""):
             f"Ya ha comido hoy: {', '.join(eaten_names) or 'nada aún'}. "
             f"Preferencias o alergias: {prefs or 'ninguna'}."
         )
+        if avoid:
+            user_text += (
+                " YA te he pedido antes estos platos e ingredientes: "
+                + ", ".join(list(dict.fromkeys(avoid))[-40:])
+                + ". NO repitas ninguno de esos platos ni uses esos ingredientes como base de la receta; "
+                "propón algo claramente distinto (otra proteína, otro carbohidrato y otro estilo de plato)."
+            )
+        if attempt and repeated_last:
+            user_text += (
+                " IMPORTANTE: en el intento anterior repetías ingredientes o platos ya usados; "
+                "cambia por completo los ingredientes principales."
+            )
         if attempt:
             user_text += (
                 " IMPORTANTE: en el intento anterior las calorías quedaron lejos del objetivo. "
@@ -936,8 +1025,17 @@ def ai_plan(targets, eaten_names, prefs=""):
                 raise
             break
         meals = data.get("meals") if isinstance(data, dict) else data
+        repeated_last = False
         for idx, m in zip(pending, meals or []):
-            plans[idx] = _plan_from_ai(m, targets[idx])
+            cand = _plan_from_ai(m, targets[idx])
+            if cand and attempt == 0 and _plan_repeats(cand, avoid):
+                fallback[idx] = cand
+                repeated_last = True
+                cand = None
+            plans[idx] = cand
+    for idx, cand in fallback.items():
+        if plans[idx] is None:
+            plans[idx] = cand
     return plans
 
 BTN_ICONS = {
@@ -1474,6 +1572,7 @@ def main(page: ft.Page):
     current_user_id = [None]
     on_new_day = [None]  # callback que se ejecuta cuando cambia el día (00:00)
     selected_meal_for_add = ["Desayuno"]
+    meal_manual = [False]  # True si la persona eligió una comida a mano (no se pisa con el horario)
     expanded_meal = [None]
     expanded_groups = set()  # ids de grupos (Mis comidas) con el desglose abierto en Hoy
 
@@ -2521,6 +2620,7 @@ def main(page: ft.Page):
 
         def go_to_add_for_meal(meal_name):
             selected_meal_for_add[0] = meal_name
+            meal_manual[0] = True
             render_meal_selector_pills()
             switch_tab(1)
 
@@ -3093,18 +3193,11 @@ def main(page: ft.Page):
         lbl_meal_dest = ft.Text("", size=12, weight=ft.FontWeight.W_600, color="#77736A")
 
         def default_meal_for_now():
-            """Comida que toca según la hora (hora de España): así no se apunta todo al desayuno."""
+            """Comida que toca según la hora y el horario de Perfil > Ajustes (por defecto,
+            hasta las 13:30 todo va a Desayuno)."""
             now = now_local()
             h = now.hour + now.minute / 60.0
-            if h < 5:
-                return "Cena"
-            if h < 11.5:
-                return "Desayuno"
-            if h < 16.5:
-                return "Almuerzo"
-            if h < 19.5:
-                return "Snacks"
-            return "Cena"
+            return meal_for_hour(h, db.get_meal_schedule(current_user_id[0]))
 
         selected_meal_for_add[0] = default_meal_for_now()
 
@@ -3120,6 +3213,7 @@ def main(page: ft.Page):
                         border_radius=10,
                         on_click=lambda e, mn=m_name: (
                             selected_meal_for_add.__setitem__(0, mn),
+                            meal_manual.__setitem__(0, True),
                             render_meal_selector_pills(),
                             page.update(),
                         ),
@@ -3148,6 +3242,7 @@ def main(page: ft.Page):
                         border_radius=10,
                         on_click=lambda e, mn=m_name: (
                             selected_meal_for_add.__setitem__(0, mn),
+                            meal_manual.__setitem__(0, True),
                             render_meal_selector_pills(),
                             page.update(),
                         ),
@@ -3965,7 +4060,7 @@ def main(page: ft.Page):
         # ----- PLAN DE RECETAS PARA LLEGAR EXACTO A LAS CALORÍAS -----
         plan_state = {
             "n": 0, "plans": [], "targets": [], "rem": 0, "done": set(), "switches": {},
-            "mode": "day", "meal": "Desayuno",
+            "mode": "day", "avoid": [], "avoid_date": "",
         }
         split_row = ft.Row(spacing=6, wrap=True)
         split_label = ft.Text("Repartir en:", size=12, weight=ft.FontWeight.W_600, color="#77736A")
@@ -4039,7 +4134,9 @@ def main(page: ft.Page):
             if mode:
                 plan_state["mode"] = mode
             if meal:
-                plan_state["meal"] = meal
+                selected_meal_for_add[0] = meal
+                meal_manual[0] = True
+                render_meal_selector_pills()
             render_plan_mode()
             page.update()
 
@@ -4051,7 +4148,7 @@ def main(page: ft.Page):
                 _pill("Completar una comida", is_meal, lambda e: set_plan_mode(mode="meal")),
             ]
             meal_pick_row.controls = [
-                _pill(m, plan_state["meal"] == m, lambda e, mm=m: set_plan_mode(meal=mm))
+                _pill(m, selected_meal_for_add[0] == m, lambda e, mm=m: set_plan_mode(meal=mm))
                 for m in MEALS_META
             ]
             meal_pick_row.visible = is_meal
@@ -4061,15 +4158,15 @@ def main(page: ft.Page):
             if is_meal and current_user_id[0] is not None:
                 u = db.get_user(current_user_id[0])
                 if u:
-                    g = meal_gap(db.get_today_foods(current_user_id[0]), u, plan_state["meal"])
+                    g = meal_gap(db.get_today_foods(current_user_id[0]), u, selected_meal_for_add[0])
                     if g["kcal"] >= 60:
                         meal_info_txt.value = (
-                            f"{plan_state['meal']}: llevas {g['eaten']} de {g['target']} kcal "
+                            f"{selected_meal_for_add[0]}: llevas {g['eaten']} de {g['target']} kcal "
                             f"· te faltan {g['kcal']} kcal"
                         )
                     else:
                         meal_info_txt.value = (
-                            f"{plan_state['meal']}: llevas {g['eaten']} de {g['target']} kcal · ya está completa"
+                            f"{selected_meal_for_add[0]}: llevas {g['eaten']} de {g['target']} kcal · ya está completa"
                         )
 
         render_plan_mode()
@@ -4231,7 +4328,7 @@ def main(page: ft.Page):
             rem, eaten = today_remaining()
             if plan_state["mode"] == "meal":
                 # Completar SOLO una comida (desayuno, almuerzo, cena o snacks) hasta su objetivo
-                meal = plan_state["meal"]
+                meal = selected_meal_for_add[0]
                 g = meal_gap(foods, u, meal)
                 R = g["kcal"]
                 if R < 60:
@@ -4268,12 +4365,20 @@ def main(page: ft.Page):
                 ]
             set_plan_busy(True, f"Creando {n} receta{'s' if n > 1 else ''} de ~{kcals[0]} kcal…")
             try:
-                plans = await asyncio.to_thread(ai_plan, targets, eaten, (tf_prefs.value or "").strip())
+                if plan_state["avoid_date"] != today_str():
+                    plan_state.update(avoid=[], avoid_date=today_str())
+                plans = await asyncio.to_thread(
+                    ai_plan, targets, eaten, (tf_prefs.value or "").strip(), list(plan_state["avoid"])
+                )
             except Exception as ex:
                 set_plan_busy(False)
                 notify(f"IA: {ex}", "#B8453A")
                 return
             plan_state.update(plans=plans, targets=targets, rem=R, done=set())
+            for pl in plans:
+                if pl:
+                    plan_state["avoid"].extend(plan_avoid_terms(pl))
+            plan_state["avoid"] = list(dict.fromkeys(plan_state["avoid"]))[-60:]
             render_plan()
             render_plan_mode()
             set_plan_busy(False)
@@ -4577,9 +4682,90 @@ def main(page: ft.Page):
         # ----- CAPA 4: PERFIL DEL USUARIO ACTIVO -----
         profile_summary_col = ft.Column(spacing=12)
 
+        profile_view = {"settings": False}
+
+        def open_settings(e=None):
+            profile_view["settings"] = True
+            refresh_profile_tab()
+
+        def close_settings(e=None):
+            profile_view["settings"] = False
+            refresh_profile_tab()
+
+        def render_settings_panel():
+            """Ajustes (dentro de Perfil): horario con el que se elige la comida por defecto."""
+            sch = db.get_meal_schedule(current_user_id[0])
+            fields = {
+                "b": ft.TextField(label="Desayuno hasta", value=sch["b"], hint_text="HH:MM", width=170,
+                                  bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3"),
+                "l": ft.TextField(label="Almuerzo hasta", value=sch["l"], hint_text="HH:MM", width=170,
+                                  bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3"),
+                "s": ft.TextField(label="Snacks hasta", value=sch["s"], hint_text="HH:MM", width=170,
+                                  bgcolor="#ffffff", border_radius=10, border_color="#E4DFD3"),
+            }
+
+            def fmt(v):
+                hh, mm = divmod(int(round(v * 60)), 60)
+                return f"{hh:02d}:{mm:02d}"
+
+            def apply_schedule(new):
+                db.set_meal_schedule(current_user_id[0], new)
+                if not meal_manual[0]:
+                    selected_meal_for_add[0] = default_meal_for_now()
+                    render_meal_selector_pills()
+                notify("Horario de comidas guardado", "#3F7D58")
+                close_settings()
+
+            def save(e):
+                vals = {k: parse_hhmm(tf.value) for k, tf in fields.items()}
+                if None in vals.values():
+                    notify("Usa el formato HH:MM, por ejemplo 13:30", "#B8453A")
+                    return
+                if not vals["b"] <= vals["l"] <= vals["s"]:
+                    notify("Las horas deben ir en orden: desayuno, almuerzo y snacks", "#B8453A")
+                    return
+                apply_schedule({k: fmt(v) for k, v in vals.items()})
+
+            profile_summary_col.controls = [
+                ft.Container(
+                    bgcolor="#ffffff", padding=20, border_radius=14, shadow=CARD_SHADOW, border=CARD_BORDER,
+                    content=ft.Column(
+                        [
+                            ft.Text("Ajustes", size=20, weight=ft.FontWeight.W_600, color="#1C1B18"),
+                            ft.Text("Horario de las comidas", size=14, weight=ft.FontWeight.W_600, color="#24543F"),
+                            ft.Text(
+                                "Lo que añadas antes de la hora de «Desayuno hasta» se apunta al desayuno. "
+                                "Después va al almuerzo, a los snacks y, pasada la última hora, a la cena. "
+                                "Siempre puedes cambiar la comida a mano al añadir.",
+                                size=12, color="#77736A",
+                            ),
+                            ft.Row(
+                                [fields["b"], fields["l"]], spacing=10, wrap=True,
+                            ),
+                            ft.Row([fields["s"]], spacing=10, wrap=True),
+                            ft.Text(
+                                "La cena es todo lo que queda después de la hora de snacks.",
+                                size=11, color="#A9A59B",
+                            ),
+                        ],
+                        spacing=10,
+                    ),
+                ),
+                make_button("Guardar horario", "#24543F", save),
+                make_button(
+                    "Restaurar valores por defecto", "#E4DFD3",
+                    lambda e: apply_schedule(None), text_color="#3A3832",
+                ),
+                make_button("Volver al perfil", "#3A3832", close_settings),
+            ]
+            page.update()
+
         def refresh_profile_tab():
             u = db.get_user(current_user_id[0])
             if not u:
+                return
+            if profile_view["settings"]:
+                render_settings_panel()
                 return
             uid, uname, uav, uw, uh, uage, ugen, uact, ugoal, uoff, ukcal, up, uc, uf, _ = u
             act_txt, act_mult = db.get_activity_extra(uid)
@@ -4629,6 +4815,7 @@ def main(page: ft.Page):
                         is_first_user=False, edit_user_data=u
                     ),
                 ),
+                make_button("Ajustes", "#77736A", open_settings),
                 make_button(
                     "Cambiar de perfil",
                     "#3A3832",
@@ -4903,6 +5090,13 @@ def main(page: ft.Page):
                 close_camera_inline()
             if index != 2 and ai_camera_holder.visible:
                 close_ai_camera()
+            if index != 5:
+                profile_view["settings"] = False
+            if index == 0:
+                meal_manual[0] = False
+            if index in (1, 2) and not meal_manual[0]:
+                selected_meal_for_add[0] = default_meal_for_now()
+                render_meal_selector_pills()
             if index == 0:
                 refresh_dashboard()
             elif index == 1:
