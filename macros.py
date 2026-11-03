@@ -777,14 +777,30 @@ ACTIVITY_PROMPT = (
     "días; summary en español, máximo 25 palabras."
 )
 
+PLAN_STYLES = {
+    "basic": (
+        "ESTILO BÁSICO: recetas caseras y sencillas hechas SOLO con alimentos que hay en casi todas las casas "
+        "(arroz, pasta, pan, huevos, patata, legumbres cocidas o de bote, lata de atún, verduras comunes como "
+        "tomate, cebolla, zanahoria, calabacín, pimiento o lechuga, pollo, jamón, queso, leche, yogur, fruta "
+        "común, avena, aceite de oliva…). No te limites a esos ejemplos, pero nada raro, caro ni difícil de "
+        "encontrar. Máximo 20 minutos. Varía las combinaciones entre comidas."
+    ),
+    "creative": (
+        "ESTILO ORIGINAL: recetas innovadoras y sorprendentes, claramente distintas de lo típico de casa "
+        "(fusión de cocinas, combinaciones o texturas poco habituales, platos de otros países, versiones "
+        "creativas de clásicos). Deben poder hacerse en casa con ingredientes de un supermercado normal, en "
+        "máximo 30 minutos, y ser realmente apetecibles y equilibradas."
+    ),
+}
+
 PLAN_TOLERANCE = 50  # margen ± kcal por comida
 MAX_MEAL_KCAL = 800  # a partir de aquí se reparte en varias comidas
 MIN_MEAL_KCAL = 150  # no tiene sentido una comida más pequeña
 
 PLAN_PROMPT = (
     "Eres un nutricionista deportivo y cocinero. El usuario debe completar las calorías del día con "
-    "una o varias comidas. Para CADA comida pedida crea UNA receta sencilla (ingredientes comunes y "
-    "baratos, máximo 20 minutos) cuyas calorías se acerquen lo máximo posible al OBJETIVO de esa "
+    "una o varias comidas. Para CADA comida pedida crea UNA receta (el ESTILO de receta se indica al final) "
+    "cuyas calorías se acerquen lo máximo posible al OBJETIVO de esa "
     "comida; prioriza la proteína, no repitas el ingrediente principal entre comidas y respeta "
     "alergias y preferencias. Devuelve SOLO JSON con este formato: "
     '{"meals":[{"title":"...","description":"una frase","ingredients":[{"name":"...","grams":0,'
@@ -978,7 +994,7 @@ def _plan_repeats(plan, avoid):
     return False
 
 
-def ai_plan(targets, eaten_names, prefs="", avoid=None):
+def ai_plan(targets, eaten_names, prefs="", avoid=None, style="basic"):
     """Una receta por objetivo. Devuelve una lista (None donde no se pudo ajustar).
 
     `avoid`: platos e ingredientes de recetas anteriores que no deben repetirse."""
@@ -999,7 +1015,8 @@ def ai_plan(targets, eaten_names, prefs="", avoid=None):
         user_text = (
             f"Comidas a crear ({len(pending)}): " + "; ".join(lines) + ". "
             f"Ya ha comido hoy: {', '.join(eaten_names) or 'nada aún'}. "
-            f"Preferencias o alergias: {prefs or 'ninguna'}."
+            f"Preferencias o alergias: {prefs or 'ninguna'}. "
+            + ("Recuerda: estilo ORIGINAL e innovador." if style == "creative" else "Recuerda: estilo BÁSICO, solo alimentos de casa.")
         )
         if avoid:
             user_text += (
@@ -1019,7 +1036,8 @@ def ai_plan(targets, eaten_names, prefs="", avoid=None):
                 "Ajusta las cantidades para que 4*p + 4*c + 9*f de los ingredientes sume justo las kcal pedidas."
             )
         try:
-            data = extract_json(ask_ai(PLAN_PROMPT, user_text, max_tokens=1000 * len(pending) + 1500))
+            sys_prompt = PLAN_PROMPT + " " + PLAN_STYLES.get(style, PLAN_STYLES["basic"])
+            data = extract_json(ask_ai(sys_prompt, user_text, max_tokens=1000 * len(pending) + 1500))
         except Exception:
             if attempt == 0:
                 raise
@@ -1599,6 +1617,16 @@ def main(page: ft.Page):
         padding=12,
         visible=False,
     )
+
+    _last_fire = {}
+
+    def fired_twice(key, window=1.5):
+        """True si la misma acción ya se ejecutó hace un instante (doble toque / doble evento)."""
+        t = time.monotonic()
+        if t - _last_fire.get(key, -999.0) < window:
+            return True
+        _last_fire[key] = t
+        return False
 
     def notify(msg, color="#24543F"):
         status_text.value = msg
@@ -2805,6 +2833,8 @@ def main(page: ft.Page):
                         done_groups = set()
                         for r in m_foods:
                             fid, _, fname, fgrams, fkcal, fp, fc_val, ff, fimg, gid, gname = r
+                            if gid and sum(1 for x in m_foods if x[9] and (x[10] or x[9]) == (gname or gid)) == 1:
+                                gid = None  # conjunto de un solo alimento: se ve como una fila normal, no repetida
                             if gid:
                                 # Conjunto de «Mis comidas»: una sola fila; al pulsar se ve el desglose
                                 # Un solo conjunto por nombre dentro de cada comida (evita filas repetidas)
@@ -3457,6 +3487,8 @@ def main(page: ft.Page):
                 f = float(tf_f.value) * factor
 
                 meal_dest = selected_meal_for_add[0]
+                if fired_twice(("food", meal_dest, name.lower(), round(grams, 1))):
+                    return
                 db.add_food(current_user_id[0], meal_dest, name, grams, k, p, c, f, current_food_image[0])
                 extra = ""
                 for field in (tf_name, tf_kcal, tf_p, tf_c, tf_f):
@@ -3525,6 +3557,8 @@ def main(page: ft.Page):
             )
 
         def use_saved_meal(sid):
+            if fired_twice(("saved", sid)):
+                return
             for s_id, sname, _, items in db.get_saved_meals(current_user_id[0]):
                 if s_id == sid:
                     meal_dest = selected_meal_for_add[0]
@@ -3749,7 +3783,7 @@ def main(page: ft.Page):
 
         def save_today_meal_as_fixed(e=None):
             mn = selected_meal_for_add[0]
-            foods = [x for x in db.get_today_foods(current_user_id[0]) if x[1] == mn]
+            foods = [x for x in db.get_today_foods(current_user_id[0]) if canon_meal(x[1]) == mn]
             save_fixed_dialog(
                 [
                     {"name": x[2], "grams": x[3], "kcal": x[4], "p": x[5], "c": x[6], "f": x[7], "image": x[8]}
@@ -4068,11 +4102,12 @@ def main(page: ft.Page):
         # ----- PLAN DE RECETAS PARA LLEGAR EXACTO A LAS CALORÍAS -----
         plan_state = {
             "n": 0, "plans": [], "targets": [], "rem": 0, "done": set(), "switches": {},
-            "mode": "day", "avoid": [], "avoid_date": "",
+            "mode": "day", "avoid": [], "avoid_date": "", "style": "basic",
         }
         split_row = ft.Row(spacing=6, wrap=True)
         split_label = ft.Text("Repartir en:", size=12, weight=ft.FontWeight.W_600, color="#77736A")
         mode_row = ft.Row(spacing=6, wrap=True)
+        style_row = ft.Row(spacing=6, wrap=True)
         meal_pick_row = ft.Row(spacing=6, wrap=True, visible=False)
         meal_info_txt = ft.Text("", size=12, color="#24543F", weight=ft.FontWeight.W_600, visible=False)
         tf_prefs = ft.TextField(
@@ -4116,7 +4151,7 @@ def main(page: ft.Page):
         def meal_gap(foods, u, meal):
             """kcal y macros que faltan para completar UNA comida (su parte del objetivo diario)."""
             ratio = MEALS_META[meal]["ratio"]
-            mf = [f for f in foods if f[1] == meal]
+            mf = [f for f in foods if canon_meal(f[1]) == meal]
             return {
                 "target": round(u[10] * ratio),
                 "eaten": round(sum(f[4] for f in mf)),
@@ -4148,9 +4183,18 @@ def main(page: ft.Page):
             render_plan_mode()
             page.update()
 
+        def set_plan_style(style):
+            plan_state["style"] = style
+            render_plan_mode()
+            page.update()
+
         def render_plan_mode():
             """Pastillas «Todo el día / Una comida» y, en este último modo, la comida a completar."""
             is_meal = plan_state["mode"] == "meal"
+            style_row.controls = [
+                _pill("🏠 Básicas (de casa)", plan_state["style"] == "basic", lambda e: set_plan_style("basic")),
+                _pill("✨ Originales", plan_state["style"] == "creative", lambda e: set_plan_style("creative")),
+            ]
             mode_row.controls = [
                 _pill("Todo el día", not is_meal, lambda e: set_plan_mode(mode="day")),
                 _pill("Completar una comida", is_meal, lambda e: set_plan_mode(mode="meal")),
@@ -4185,7 +4229,7 @@ def main(page: ft.Page):
                 return [selected_meal_for_add[0]]
             order = list(MEALS_META.keys())
             deficit = {
-                m: tkcal * MEALS_META[m]["ratio"] - sum(f[4] for f in foods if f[1] == m) for m in order
+                m: tkcal * MEALS_META[m]["ratio"] - sum(f[4] for f in foods if canon_meal(f[1]) == m) for m in order
             }
             pool = sorted([m for m in order if m != "Snacks"], key=lambda m: -deficit[m])
             if n > len(pool):
@@ -4376,7 +4420,8 @@ def main(page: ft.Page):
                 if plan_state["avoid_date"] != today_str():
                     plan_state.update(avoid=[], avoid_date=today_str())
                 plans = await asyncio.to_thread(
-                    ai_plan, targets, eaten, (tf_prefs.value or "").strip(), list(plan_state["avoid"])
+                    ai_plan, targets, eaten, (tf_prefs.value or "").strip(), list(plan_state["avoid"]),
+                    plan_state["style"],
                 )
             except Exception as ex:
                 set_plan_busy(False)
@@ -4432,6 +4477,13 @@ def main(page: ft.Page):
                     meal_info_txt,
                     split_label,
                     split_row,
+                    ft.Text("Tipo de recetas:", size=12, weight=ft.FontWeight.W_600, color="#77736A"),
+                    style_row,
+                    ft.Text(
+                        "Básicas: platos de siempre con lo que hay en cualquier casa (arroz, pasta, pan, atún, "
+                        "verdura, huevos…). Originales: ideas más creativas y diferentes.",
+                        size=11, color="#A9A59B",
+                    ),
                     tf_prefs,
                     make_button("Generar plan de recetas", "#24543F", run_suggestions),
                     plan_loading,
@@ -4866,6 +4918,8 @@ def main(page: ft.Page):
         def copy_meal_to_today(m_foods, m_name, label):
             # Va a la MISMA comida de hoy (el desayuno de ayer -> el desayuno de hoy) y cada
             # alimento entra suelto: sin crear conjuntos/apartados nuevos.
+            if fired_twice(("copy", m_name, label)):
+                return
             dest = canon_meal(m_name)
             items = [{**it, "gname": None, "gkey": None} for it in hist_items(m_foods)]
             add_items_to_log(items, dest)
